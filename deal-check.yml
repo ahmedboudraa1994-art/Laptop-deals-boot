@@ -1,0 +1,32 @@
+name: Laptop Deals Canada
+
+on:
+  schedule:
+    # Heures Montréal approximatives pendant l'heure d'été (EDT, UTC-4):
+    # 08:00, 10:00, 15:00, 17:00, 20:00 Montreal
+    - cron: "0 0,12,14,19,21 * * *"
+  workflow_dispatch:
+
+jobs:
+  check-deals:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requirements
+        run: pip install -r requirements.txt
+
+      - name: Run laptop deal monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_BUDGET: "1000"
+          ALERT_TOLERANCE: "50"
+          SEND_ALWAYS: "true"
+        run: python deals_monitor.py
