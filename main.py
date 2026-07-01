@@ -18,8 +18,11 @@ MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "1000"))
 HEADLESS = os.getenv("HEADLESS", "1") != "0"
 SEEN_FILE = Path("seen_deals.json")
-MAX_RESULTS_PER_SITE = 5
+MAX_RESULTS_PER_SITE = 4
 MAX_TOTAL_DEALS = 8
+SITE_TIMEOUT_SECONDS = 55
+PRODUCT_TIMEOUT_MS = 9000
+SEARCH_TIMEOUT_MS = 9000
 
 QUERIES = [
     "rtx 4060 laptop",
@@ -214,8 +217,8 @@ def score(title: str, price: float) -> int:
 
 async def get_final_same_domain(page, url: str, domain: str) -> Optional[str]:
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        await page.wait_for_timeout(1200)
+        await page.goto(url, wait_until="domcontentloaded", timeout=PRODUCT_TIMEOUT_MS)
+        await page.wait_for_timeout(600)
         final_url = page.url
         if not domain_ok(final_url, domain):
             print("Rejected redirected domain:", url, "->", final_url)
@@ -241,7 +244,7 @@ async def confirm_product(context, site: Site, title: str, url: str) -> Optional
 
         page_title = await page.title()
         html = await page.content()
-        visible_text = await page.locator("body").inner_text(timeout=5000)
+        visible_text = await page.locator("body").inner_text(timeout=3000)
 
         combined_title = title
         if page_title and len(page_title) > len(combined_title):
@@ -282,8 +285,8 @@ async def collect_candidates(context, site: Site, query: str) -> list[tuple[str,
     candidates = []
     try:
         search_url = site.search_url.format(q=quote_plus(query))
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=25000)
-        await page.wait_for_timeout(2200)
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
+        await page.wait_for_timeout(900)
 
         links = await page.locator("a[href]").evaluate_all("""
             els => els.map(a => ({href: a.href, text: (a.innerText || a.textContent || '').trim()}))
@@ -343,11 +346,27 @@ async def run_bot() -> None:
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
 
+        async def block_unneeded(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await context.route("**/*", block_unneeded)
+
         for site in SITES:
-            print("Checking", site.name)
-            deals, tested = await scrape_site(context, site)
-            stats[site.name] = {"confirmed": len(deals), "tested": tested}
-            all_deals.extend(deals)
+            print("Checking", site.name, flush=True)
+            try:
+                deals, tested = await asyncio.wait_for(scrape_site(context, site), timeout=SITE_TIMEOUT_SECONDS)
+                stats[site.name] = {"confirmed": len(deals), "tested": tested}
+                all_deals.extend(deals)
+                print(f"Done {site.name}: {len(deals)} confirmed, {tested} tested", flush=True)
+            except asyncio.TimeoutError:
+                stats[site.name] = {"confirmed": 0, "tested": 0}
+                print(f"Timeout site {site.name} after {SITE_TIMEOUT_SECONDS}s", flush=True)
+            except Exception as e:
+                stats[site.name] = {"confirmed": 0, "tested": 0}
+                print(f"Error site {site.name}: {e}", flush=True)
 
         await browser.close()
 
