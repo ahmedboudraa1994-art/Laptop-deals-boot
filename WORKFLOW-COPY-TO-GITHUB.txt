@@ -1,0 +1,36 @@
+Create file named .github/workflows/laptop-deals.yml and paste this:
+
+name: Laptop Deals Telegram Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub Actions uses UTC.
+    # Approx 8h, 17h, 20h Montréal during daylight saving time.
+    - cron: "0 12 * * *"
+    - cron: "0 21 * * *"
+    - cron: "0 0 * * *"
+
+jobs:
+  laptop-deals:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run laptop deals bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_PRICE: ${{ secrets.MAX_PRICE }}
+          KEYWORDS: ${{ secrets.KEYWORDS }}
+        run: python main.py
