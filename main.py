@@ -11,7 +11,8 @@ MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 SEEN_FILE = "seen_deals.json"
 TIMEOUT = 12
 MAX_SITE_WORKERS = 6       # requêtes de recherche en parallèle (par site x query)
-MAX_PRICE_WORKERS = 10     # requêtes de confirmation de prix en parallèle
+MAX_PRICE_WORKERS = 4      # réduit les blocages et accélère GitHub Actions
+MAX_CANDIDATES_PER_SEARCH = 6  # évite de vérifier 100 liens inutiles par recherche
 
 # ---------------------------------------------------------------------------
 # PERSISTANCE seen_deals.json (GitHub Actions) :
@@ -139,6 +140,38 @@ def money_prices(text):
             pass
     return out
 
+
+
+
+def plausible_price_for_title(title, price, site):
+    """Filtre anti-faux prix.
+    Beaucoup de pages affichent des montants qui ne sont PAS le prix final:
+    mensualités, économies, accessoires, ancien prix partiel, prix vendeur externe.
+    Ici on rejette les combinaisons impossibles sous 1000 CAD.
+    """
+    t = title.lower()
+
+    # Ces GPU / machines sont presque impossibles sous 1000 CAD au Canada.
+    impossible_under_1000 = [
+        "rtx 5090", "rtx 5080", "rtx 5070 ti", "rtx 5070",
+        "legion pro 7", "legion pro 7i", "legion pro 5", "legion pro 5i",
+        "core ultra 9", "i9-", " i9 ", "ryzen 9 275hx", "ryzen 9 7945hx",
+    ]
+    if price < 1000 and any(x in t for x in impossible_under_1000):
+        print(f"[{site}] REJETÉ prix impossible: {price} CAD | {title[:90]}")
+        return False
+
+    # RTX 5060 à très bas prix est souvent un faux montant extrait.
+    if "rtx 5060" in t and price < 900:
+        print(f"[{site}] REJETÉ RTX 5060 trop bas: {price} CAD | {title[:90]}")
+        return False
+
+    # RTX 4070 sous 750 CAD est très suspect sauf si clairement open box/refurbished.
+    if "rtx 4070" in t and price < 750 and "open box" not in t and "refurb" not in t:
+        print(f"[{site}] REJETÉ RTX 4070 trop bas: {price} CAD | {title[:90]}")
+        return False
+
+    return True
 
 def get_jsonld_price(soup):
     for tag in soup.find_all("script", type="application/ld+json"):
@@ -308,6 +341,10 @@ def scrape_search(site, template, query):
         if not candidates and site in JS_HEAVY_SITES:
             print(f"[{site}] 0 candidat pour '{query}' (rendu JS probable, requests seul insuffisant)")
 
+        # Limite importante : on vérifie seulement les premiers candidats propres.
+        # Ça évite les runs longs et les faux liens de footer/menu.
+        candidates = candidates[:MAX_CANDIDATES_PER_SEARCH]
+
         with ThreadPoolExecutor(max_workers=MAX_PRICE_WORKERS) as pool:
             futures = {
                 pool.submit(confirmed_price, session, url, site, allowed_domain): (title, url)
@@ -322,6 +359,10 @@ def scrape_search(site, template, query):
                     price, final_url = None, None
                 if price is None:
                     continue
+
+                if not plausible_price_for_title(title, price, site):
+                    continue
+
                 deals.append({
                     "title": title[:150],
                     "price": price,
@@ -415,7 +456,11 @@ def main():
             f"🔗 {d['url']}\n\n"
         )
 
-    msg += "Prix vérifié sur la page produit (lien validé, même domaine que le site). Vérifie quand même taxes, stock Montréal et Open Box."
+    msg += "Sites vérifiés ce run:\n"
+    for site in SEARCHES:
+        msg += f"- {site}: {stats[site]} confirmés, {errors[site]} erreurs\n"
+
+    msg += "\nPrix vérifié sur la page produit (lien validé, même domaine que le site). Vérifie quand même taxes, stock Montréal et Open Box."
 
     send_telegram(msg)
     save_seen(seen)
