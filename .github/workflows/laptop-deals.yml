@@ -2,6 +2,7 @@ name: Laptop Deals Telegram Bot
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "0 12 * * *"
     - cron: "0 21 * * *"
@@ -31,6 +32,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAX_PRICE: ${{ secrets.MAX_PRICE }}
+          MIN_PRICE: 600
         run: python main.py
 
       - name: Save seen deals
