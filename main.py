@@ -18,8 +18,9 @@ HEADLESS = os.environ.get("HEADLESS", "1") != "0"
 
 SEEN_FILE = Path("seen_deals.json")
 MAX_RESULTS_PER_RUN = int(os.environ.get("MAX_RESULTS_PER_RUN", "10"))
-SITE_TIMEOUT_MS = int(os.environ.get("SITE_TIMEOUT_MS", "55000"))
-PRODUCT_TIMEOUT_MS = int(os.environ.get("PRODUCT_TIMEOUT_MS", "25000"))
+MAX_KEYWORDS_PER_SITE = int(os.environ.get("MAX_KEYWORDS_PER_SITE", "4"))
+SITE_TIMEOUT_MS = int(os.environ.get("SITE_TIMEOUT_MS", "12000"))
+PRODUCT_TIMEOUT_MS = int(os.environ.get("PRODUCT_TIMEOUT_MS", "10000"))
 
 KEYWORDS = [
     "rtx 4060 laptop", "rtx 4070 laptop", "rtx 4050 laptop",
@@ -194,7 +195,7 @@ async def safe_goto(page, url: str, timeout_ms: int) -> bool:
             return True
         except Exception as e:
             last = str(e).split("\n")[0]
-    print(f"Navigation failed: {url} :: {last}")
+    print(f"Navigation failed: {url} :: {last}", flush=True)
     return False
 
 async def collect_links_from_search(page, site: Dict, keyword: str) -> List[str]:
@@ -275,16 +276,17 @@ async def run_scraper() -> Tuple[List[Deal], List[str]]:
             locale="en-CA",
         )
         page = await context.new_page()
+        print("Bot started - strict product mode", flush=True)
         for site in SITES:
             tested = 0
             confirmed = 0
-            print(f"Checking {site['name']}")
+            print(f"Checking {site['name']}", flush=True)
             site_links = []
-            for kw in KEYWORDS:
+            for kw in KEYWORDS[:MAX_KEYWORDS_PER_SITE]:
                 try:
                     site_links.extend(await collect_links_from_search(page, site, kw))
                 except Exception as e:
-                    print(f"[{site['name']}] search error for {kw}: {str(e).splitlines()[0]}")
+                    print(f"[{site['name']}] search error for {kw}: {str(e).splitlines()[0]}", flush=True)
             unique_links = []
             for link in site_links:
                 if link not in unique_links:
@@ -299,11 +301,11 @@ async def run_scraper() -> Tuple[List[Deal], List[str]]:
                     if deal:
                         confirmed += 1
                         deals.append(deal)
-                        print(f"CONFIRMED {deal.site}: {deal.title} - ${deal.price}")
+                        print(f"CONFIRMED {deal.site}: {deal.title} - ${deal.price}", flush=True)
                 except Exception as e:
-                    print(f"[{site['name']}] verify error: {str(e).splitlines()[0]}")
+                    print(f"[{site['name']}] verify error: {str(e).splitlines()[0]}", flush=True)
             reports.append(f"- {site['name']}: {confirmed} confirmés, {tested} liens produits testés")
-            print(f"Done {site['name']}: {confirmed} confirmed, {tested} tested")
+            print(f"Done {site['name']}: {confirmed} confirmed, {tested} tested", flush=True)
         await browser.close()
     deals.sort(key=lambda d: (-d.score, d.price))
     return deals[:MAX_RESULTS_PER_RUN], reports
