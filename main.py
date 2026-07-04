@@ -1,4 +1,5 @@
 import os, re, json, asyncio
+from collections import Counter
 from urllib.parse import quote_plus, urlparse, urljoin
 import requests
 from playwright.async_api import async_playwright
@@ -10,7 +11,7 @@ MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 SEEN_FILE = "seen_deals.json"
 
 PAGE_TIMEOUT = 14000
-SITE_TIMEOUT = 240
+SITE_TIMEOUT = 220
 MAX_QUERIES_PER_SITE = 4
 MAX_PRODUCTS_PER_SITE = 8
 MAX_RESULTS_TO_SEND = 8
@@ -279,7 +280,7 @@ def score_deal(title, price):
 async def safe_goto(page, url):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await page.wait_for_timeout(900)
+        await page.wait_for_timeout(2500)
         return True
     except Exception as e:
         print("goto failed:", url, str(e)[:100])
@@ -397,32 +398,71 @@ async def get_product_data(page, fallback_title, strict):
 
     return title, price, "ok"
 
+def title_from_url(url):
+    try:
+        slug = urlparse(url).path.rstrip("/").split("/")[-1]
+        slug = re.sub(r"\.(html|htm)$", "", slug, flags=re.I)
+        slug = re.sub(r"[-_]+", " ", slug)
+        return normalize_title(slug)
+    except Exception:
+        return ""
+
 async def collect_links(page, search_url, cfg):
+    debug = Counter()
     try:
         anchors = await page.locator("a[href]").evaluate_all("""
             els => els.map(a => ({href: a.href, text: (a.innerText || a.textContent || '').trim()}))
         """)
     except Exception:
         anchors = []
+        debug["anchors_error"] += 1
+
+    debug["anchors_total"] = len(anchors)
     out, seen = [], set()
+
     for a in anchors:
-        url = clean_url(search_url, a.get("href"), cfg["domain"])
-        title = normalize_title(a.get("text"))
-        if not url or url in seen:
+        raw_href = a.get("href")
+        raw_url = urljoin(search_url, raw_href or "").split("#")[0]
+
+        if not raw_href or not raw_url.startswith("http"):
+            debug["reject_no_http"] += 1
             continue
+        if not same_domain(raw_url, cfg["domain"]):
+            debug["reject_domain"] += 1
+            continue
+        if is_bad_url(raw_url):
+            debug["reject_bad_url"] += 1
+            continue
+
+        url = raw_url
+        if url in seen:
+            debug["reject_duplicate"] += 1
+            continue
+
         if not any(h.lower() in url.lower() for h in cfg["hints"]):
+            debug["reject_hints"] += 1
             continue
+
+        title = normalize_title(a.get("text"))
+        if not title or len(title) < 18:
+            title = title_from_url(url)
+
         if not valid_title(title):
+            debug["reject_title"] += 1
             continue
+
         seen.add(url)
         out.append((title, url))
+        debug["accepted"] += 1
         if len(out) >= MAX_PRODUCTS_PER_SITE:
             break
-    return out
+
+    return out, debug
 
 async def scrape_site(browser, site_name, cfg):
     stats = {"tested": 0, "confirmed": 0, "rejected": 0, "errors": 0}
     deals = []
+    reason_counter = Counter()
 
     async def inner():
         context = await browser.new_context(
@@ -438,7 +478,18 @@ async def scrape_site(browser, site_name, cfg):
                 if not await safe_goto(page, search_url):
                     stats["errors"] += 1
                     continue
-                for title, url in await collect_links(page, search_url, cfg):
+                found, link_debug = await collect_links(page, search_url, cfg)
+                for k, v in link_debug.items():
+                    if v:
+                        reason_counter[f"links {k}"] += v
+                if not found:
+                    # JS-rendered results may not have painted yet; wait a bit longer and retry once
+                    await page.wait_for_timeout(2500)
+                    found, link_debug = await collect_links(page, search_url, cfg)
+                    for k, v in link_debug.items():
+                        if v:
+                            reason_counter[f"retry links {k}"] += v
+                for title, url in found:
                     if url not in used:
                         used.add(url)
                         candidates.append((title, url))
@@ -446,6 +497,8 @@ async def scrape_site(browser, site_name, cfg):
                     break
 
             print(f"[{site_name}] candidates={len(candidates)}")
+            if not candidates:
+                reason_counter["aucun lien produit trouvé (recherche)"] += 1
             for fallback, url in candidates[:MAX_PRODUCTS_PER_SITE]:
                 stats["tested"] += 1
                 if not await safe_goto(page, url):
@@ -453,11 +506,14 @@ async def scrape_site(browser, site_name, cfg):
                     continue
                 if not same_domain(page.url, cfg["domain"]) or is_bad_url(page.url):
                     stats["rejected"] += 1
+                    reason_counter["url rejetée (redirection/catégorie)"] += 1
                     print(f"[{site_name}] reject url {page.url}")
                     continue
                 title, price, reason = await get_product_data(page, fallback, cfg.get("strict", False))
                 if reason != "ok":
                     stats["rejected"] += 1
+                    short_reason = reason.split(" ")[0] if reason.startswith("unrealistic") else reason
+                    reason_counter[short_reason] += 1
                     print(f"[{site_name}] reject {reason}: {fallback[:80]}")
                     continue
                 stats["confirmed"] += 1
@@ -475,22 +531,25 @@ async def scrape_site(browser, site_name, cfg):
         await asyncio.wait_for(inner(), timeout=SITE_TIMEOUT)
     except asyncio.TimeoutError:
         stats["errors"] += 1
+        reason_counter["timeout site"] += 1
         print(f"[{site_name}] site timeout")
     except Exception as e:
         stats["errors"] += 1
         print(f"[{site_name}] error {e}")
-    return deals, stats
+    return deals, stats, reason_counter
 
 async def run():
     seen = load_seen()
     all_deals, all_stats = [], {}
+    reason_counter = Counter()
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
             for name, cfg in SITES.items():
-                deals, stats = await scrape_site(browser, name, cfg)
+                deals, stats, site_reasons = await scrape_site(browser, name, cfg)
                 all_deals.extend(deals)
                 all_stats[name] = stats
+                reason_counter.update(site_reasons)
         finally:
             await browser.close()
 
@@ -509,16 +568,24 @@ async def run():
             seen.append(d["url"])
 
     if not new:
-        msg = "Aucun nouveau vrai deal confirmé cette fois.\\n\\nSites vérifiés ce run:\\n"
+        msg = "Aucun nouveau vrai deal confirmé cette fois.\n\nSites vérifiés ce run:\n"
     else:
-        msg = f"🔥 Deals laptops confirmés Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\\n\\n"
+        msg = f"🔥 Deals laptops confirmés Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\n\n"
         for i, d in enumerate(new[:MAX_RESULTS_TO_SEND], 1):
-            msg += f"{i}. {d['title']}\\n💲 {d['price']:.2f} CAD confirmé\\n🏬 {d['site']}\\n⭐ Score: {d['score']}\\n🔗 {d['url']}\\n\\n"
-        msg += "Sites vérifiés ce run:\\n"
+            msg += f"{i}. {d['title']}\n💲 {d['price']:.2f} CAD confirmé\n🏬 {d['site']}\n⭐ Score: {d['score']}\n🔗 {d['url']}\n\n"
+        msg += "Sites vérifiés ce run:\n"
 
     for site, st in all_stats.items():
-        msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\\n"
-    msg += "\\nPrix vérifié sur fiche produit disponible. Vérifie quand même taxes, stock Montréal et Open Box."
+        tag = " (aucun lien trouvé)" if st["tested"] == 0 and st["errors"] == 0 else ""
+        msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs{tag}\n"
+
+    top_reasons = reason_counter.most_common(5)
+    if top_reasons:
+        msg += "\nTop raisons de rejet:\n"
+        for reason, count in top_reasons:
+            msg += f"- {reason}: {count}\n"
+
+    msg += "\nPrix vérifié sur fiche produit disponible. Vérifie quand même taxes, stock Montréal et Open Box."
     send_telegram(msg)
     save_seen(seen)
 
