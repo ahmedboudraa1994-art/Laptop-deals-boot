@@ -1,457 +1,485 @@
-import asyncio
-import json
 import os
 import re
-import time
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
-from urllib.parse import quote_plus, urlparse
-
+import json
+import asyncio
+from urllib.parse import quote_plus, urlparse, urljoin
+from playwright.async_api import async_playwright
 import requests
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "1000"))
-HEADLESS = os.getenv("HEADLESS", "1") != "0"
-SEEN_FILE = Path("seen_deals.json")
-MAX_RESULTS_PER_SITE = 5
-MAX_TOTAL_DEALS = 8
-SITE_TIMEOUT_SECONDS = 55
-PRODUCT_TIMEOUT_MS = 12000
-SEARCH_TIMEOUT_MS = 12000
+MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
+SEEN_FILE = "seen_deals.json"
+
+PAGE_TIMEOUT = 9000
+SITE_TIMEOUT = 110
+MAX_PRODUCTS_PER_SITE = 8
+MAX_RESULTS_TO_SEND = 8
 
 QUERIES = [
     "rtx 4060 laptop",
-    "rtx 4070 laptop",
     "rtx 4050 laptop",
+    "rtx 5060 laptop",
     "lenovo legion laptop",
     "lenovo loq laptop",
     "asus tuf laptop",
-    "asus rog laptop",
     "acer nitro laptop",
-    "msi katana laptop",
+    "msi gaming laptop",
+    "hp victus laptop",
     "dell g15 laptop",
 ]
 
-BAD_WORDS = [
-    "desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag",
-    "stand", "dock", "cooler", "warranty", "skin", "sleeve", "battery", "ram memory",
-    "ssd only", "external", "headset", "speaker", "router", "printer", "tablet", "chromebook"
-]
+SITES = {
+    "Canada Computers": {
+        "domain": "canadacomputers.com",
+        "search": "https://www.canadacomputers.com/en/search?s={q}",
+        "product_hints": ["/en/gaming-laptops/", "/en/windows-laptops/"],
+        "strict": False,
+    },
+    "Best Buy Canada": {
+        "domain": "bestbuy.ca",
+        "search": "https://www.bestbuy.ca/en-ca/search?search={q}",
+        "product_hints": ["/en-ca/product/"],
+        "strict": False,
+    },
+    "Memory Express": {
+        "domain": "memoryexpress.com",
+        "search": "https://www.memoryexpress.com/Search/Products?Search={q}",
+        "product_hints": ["/Products/"],
+        "strict": False,
+    },
+    "Newegg Canada": {
+        "domain": "newegg.ca",
+        "search": "https://www.newegg.ca/p/pl?d={q}",
+        "product_hints": ["/p/"],
+        "strict": True,
+    },
+    "Staples Canada": {
+        "domain": "staples.ca",
+        "search": "https://www.staples.ca/search?query={q}",
+        "product_hints": ["/products/"],
+        "strict": False,
+    },
+    "Walmart Canada": {
+        "domain": "walmart.ca",
+        "search": "https://www.walmart.ca/search?q={q}",
+        "product_hints": ["/ip/"],
+        "strict": False,
+    },
+    "Costco Canada": {
+        "domain": "costco.ca",
+        "search": "https://www.costco.ca/CatalogSearch?keyword={q}",
+        "product_hints": [".product."],
+        "strict": False,
+    },
+    "Lenovo Canada": {
+        "domain": "lenovo.com",
+        "search": "https://www.lenovo.com/ca/en/search?text={q}",
+        "product_hints": ["/p/", "/ca/en/p/"],
+        "strict": False,
+    },
+    "Dell Canada": {
+        "domain": "dell.com",
+        "search": "https://www.dell.com/en-ca/shop/scc/sr?~query={q}",
+        "product_hints": ["/shop/", "/laptops/"],
+        "strict": False,
+    },
+    "HP Canada": {
+        "domain": "hp.com",
+        "search": "https://www.hp.com/ca-en/shop/sitesearch?keyword={q}",
+        "product_hints": ["/pdp/", "/shop/"],
+        "strict": False,
+    },
+    "ASUS Canada": {
+        "domain": "asus.com",
+        "search": "https://www.asus.com/ca-en/searchresult?searchType=products&searchKey={q}",
+        "product_hints": ["/ca-en/laptops/", "/laptops/"],
+        "strict": False,
+    },
+    "Acer Canada": {
+        "domain": "acer.com",
+        "search": "https://www.acer.com/ca-en/search?q={q}",
+        "product_hints": ["/laptops/", "/notebooks/"],
+        "strict": False,
+    },
+    "MSI Canada": {
+        "domain": "msi.com",
+        "search": "https://ca.msi.com/search/{q}",
+        "product_hints": ["/Laptop/", "/laptop/"],
+        "strict": False,
+    },
+}
 
-GOOD_WORDS = [
-    "laptop", "notebook", "gaming", "rtx", "geforce", "legion", "loq", "tuf", "rog",
-    "nitro", "katana", "victus", "omen", "g15", "g16", "predator", "alienware"
-]
+BAD_WORDS = ["desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook"]
+GOOD_WORDS = ["laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "katana", "victus", "omen", "g15", "a16", "thin"]
+PRICE_RE = re.compile(r"(?:CAD|CA\$|\$)\s*([0-9]{3,5}(?:[, ][0-9]{3})*(?:\.[0-9]{2})?)", re.I)
 
-@dataclass
-class Site:
-    name: str
-    domain: str
-    search_url: str
-
-SITES = [
-    Site("Canada Computers", "canadacomputers.com", "https://www.canadacomputers.com/en/search?s={q}"),
-    Site("Best Buy Canada", "bestbuy.ca", "https://www.bestbuy.ca/en-ca/search?search={q}"),
-    Site("Memory Express", "memoryexpress.com", "https://www.memoryexpress.com/Search/Products?Search={q}"),
-    Site("Newegg Canada", "newegg.ca", "https://www.newegg.ca/p/pl?d={q}"),
-    Site("Staples Canada", "staples.ca", "https://www.staples.ca/search?query={q}"),
-    Site("Walmart Canada", "walmart.ca", "https://www.walmart.ca/search?q={q}"),
-    Site("Costco Canada", "costco.ca", "https://www.costco.ca/CatalogSearch?keyword={q}"),
-    Site("Lenovo Canada", "lenovo.com", "https://www.lenovo.com/ca/en/search?text={q}"),
-    Site("Dell Canada", "dell.com", "https://www.dell.com/en-ca/shop/scc/sr?~query={q}"),
-]
-
-
-def load_seen() -> set[str]:
+def load_seen():
     try:
-        if SEEN_FILE.exists():
-            data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-            return set(data if isinstance(data, list) else [])
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
     except Exception:
-        pass
-    return set()
+        return []
 
+def save_seen(seen):
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(seen[-1500:], f, ensure_ascii=False, indent=2)
 
-def save_seen(seen: set[str]) -> None:
-    SEEN_FILE.write_text(json.dumps(sorted(seen)[-2000:], indent=2), encoding="utf-8")
-
-
-def send_telegram(text: str) -> None:
+def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant dans GitHub Secrets")
-    for i in range(0, len(text), 3900):
-        chunk = text[i:i + 3900]
+        print("Telegram secrets missing")
+        return
+    parts = []
+    while text:
+        parts.append(text[:3900])
+        text = text[3900:]
+    for part in parts:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": chunk, "disable_web_page_preview": True},
+            data={"chat_id": CHAT_ID, "text": part, "disable_web_page_preview": True},
             timeout=20,
         )
         print("Telegram:", r.status_code, r.text[:200])
-        r.raise_for_status()
 
-
-def domain_ok(url: str, domain: str) -> bool:
+def same_domain(url, domain):
     try:
-        host = urlparse(url).netloc.lower().replace("www.", "")
+        host = urlparse(url).netloc.lower()
+        domain = domain.lower()
         return host == domain or host.endswith("." + domain)
     except Exception:
         return False
 
-
-def normalize_url(url: str) -> str:
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}{p.path}"
-
-
-def valid_title(title: str) -> bool:
-    t = re.sub(r"\s+", " ", title).strip().lower()
-    if len(t) < 20 or len(t) > 220:
-        return False
-    if any(w in t for w in BAD_WORDS):
-        return False
-    return any(w in t for w in GOOD_WORDS)
-
-
-def gaming_relevant(title: str) -> bool:
-    """Garde les vrais laptops intéressants et évite les IdeaPad/HP basiques à 900$."""
-    t = title.lower()
-    strong = [
-        "rtx", "geforce", "gaming", "legion", "loq", "tuf", "rog",
-        "nitro", "katana", "victus", "omen", "g15", "g16", "predator", "alienware"
-    ]
-    weak_bad = ["iris xe", "uhd graphics", "integrated", "core i3", "celeron", "pentium"]
-    if any(x in t for x in strong):
-        return True
-    if any(x in t for x in weak_bad):
-        return False
-    return "laptop" in t or "notebook" in t
-
-
-def parse_embedded_json_prices(html: str) -> Optional[float]:
-    """Cherche les prix dans les scripts JSON/Next/Nuxt quand les meta ne suffisent pas."""
-    cleaned = html.replace(",", "")
-    patterns = [
-        r'"(?:salePrice|sale_price|currentPrice|current_price|price|finalPrice|final_price|regularPrice)"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
-        r'"(?:value|amount)"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
-    ]
-    prices = []
-    for pat in patterns:
-        for x in re.findall(pat, cleaned, flags=re.I):
-            try:
-                v = float(x)
-                if MIN_PRICE <= v <= MAX_PRICE:
-                    prices.append(v)
-            except Exception:
-                pass
-    if not prices:
+def clean_url(base, href, domain):
+    if not href:
         return None
-    return sorted(set(prices))[0]
+    u = urljoin(base, href).split("#")[0]
+    if not u.startswith("http"):
+        return None
+    if not same_domain(u, domain):
+        return None
+    return u
 
+def looks_product_url(url, hints):
+    low = url.lower()
+    return any(h.lower() in low for h in hints)
 
-def extract_money(text: str) -> list[float]:
-    text = text.replace(",", "")
-    found = re.findall(r"(?:CAD\s*)?\$\s*([0-9]{3,5}(?:\.[0-9]{2})?)", text, flags=re.I)
+def normalize_title(t):
+    t = re.sub(r"\s+", " ", t or "").strip()
+    return t[:180]
+
+def valid_title(title):
+    t = title.lower()
+    if len(t) < 18:
+        return False
+    if any(b in t for b in BAD_WORDS):
+        return False
+    return any(g in t for g in GOOD_WORDS)
+
+def extract_prices(text):
+    text = (text or "").replace(",", "")
     prices = []
-    for x in found:
+    for m in PRICE_RE.findall(text):
         try:
-            p = float(x)
+            p = float(m.replace(" ", ""))
             if MIN_PRICE <= p <= MAX_PRICE:
                 prices.append(p)
         except Exception:
             pass
-    return prices
+    return sorted(set(prices))
 
+def realistic_price(title, price, strict=False):
+    t = title.lower()
+    if ("rtx 5080" in t or "rtx 5090" in t or "rtx 5070 ti" in t) and price < 1400:
+        return False
+    if "rtx 5070" in t and price < 1100:
+        return False
+    if "rtx 5060" in t and price < 750:
+        return False
+    if not any(x in t for x in ["rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "katana", "victus", "omen", "g15"]):
+        return False
+    if strict:
+        if not any(x in t for x in ["rtx 4050", "rtx 4060", "rtx 4070", "rtx 5060", "gaming", "legion", "tuf", "nitro", "katana", "victus", "omen"]):
+            return False
+        if "gateway" in t or "iris xe" in t or "uhd graphics" in t:
+            return False
+    return True
 
-def parse_jsonld_price(html: str) -> Optional[float]:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup.find_all("script", type="application/ld+json"):
-        raw = tag.get_text(" ", strip=True)
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
-        stack = data if isinstance(data, list) else [data]
-        while stack:
-            obj = stack.pop(0)
-            if isinstance(obj, dict):
-                offers = obj.get("offers")
-                if isinstance(offers, dict):
-                    price = offers.get("price") or offers.get("lowPrice")
-                    if price is not None:
-                        try:
-                            p = float(str(price).replace(",", ""))
-                            if MIN_PRICE <= p <= MAX_PRICE:
-                                return p
-                        except Exception:
-                            pass
-                elif isinstance(offers, list):
-                    stack.extend(offers)
-                stack.extend([v for v in obj.values() if isinstance(v, (dict, list))])
-            elif isinstance(obj, list):
-                stack.extend(obj)
-    return None
-
-
-def parse_meta_price(html: str) -> Optional[float]:
-    soup = BeautifulSoup(html, "html.parser")
-    selectors = [
-        {"property": "product:price:amount"},
-        {"property": "og:price:amount"},
-        {"itemprop": "price"},
-        {"name": "twitter:data1"},
-    ]
-    for sel in selectors:
-        tag = soup.find("meta", attrs=sel)
-        if tag and tag.get("content"):
-            prices = extract_money("$" + tag.get("content", ""))
-            if prices:
-                return prices[0]
-            try:
-                p = float(tag["content"].replace(",", ""))
-                if MIN_PRICE <= p <= MAX_PRICE:
-                    return p
-            except Exception:
-                pass
-    return None
-
-
-def impossible_price(title: str, price: float) -> bool:
-    t = title.lower().replace(" ", "")
-    if "rtx5090" in t or "rtx5080" in t or "rtx5070ti" in t:
-        return price < 1400
-    if "rtx5070" in t:
-        return price < 1100
-    if "rtx4080" in t or "rtx4090" in t:
-        return price < 1300
-    if "rtx4070" in t:
-        return price < 750
-    if "rtx5060" in t:
-        return price < 850
-    if "legionpro" in t and ("5070" in t or "5080" in t):
-        return True
-    return False
-
-
-def score(title: str, price: float) -> int:
+def score_deal(title, price):
     t = title.lower()
     s = 0
     if "rtx 4070" in t: s += 45
-    if "rtx 4060" in t: s += 35
-    if "rtx 4050" in t: s += 20
-    if "rtx 3050" in t: s += 5
-    if "i7" in t or "ryzen 7" in t or "ryzen 9" in t: s += 15
-    if "16gb" in t or "16 gb" in t: s += 10
-    if "1tb" in t or "1 tb" in t: s += 10
-    s += max(0, int(MAX_PRICE - price) // 25)
+    if "rtx 4060" in t: s += 38
+    if "rtx 5060" in t: s += 36
+    if "rtx 4050" in t: s += 22
+    if "i7" in t or "ryzen 7" in t or "ryzen 9" in t or "ultra 7" in t or "ultra 9" in t: s += 15
+    if "16gb" in t: s += 10
+    if "32gb" in t: s += 15
+    if "1tb" in t: s += 10
+    s += max(0, int(MAX_PRICE - price) // 30)
     return s
 
-
-async def get_final_same_domain(page, url: str, domain: str) -> Optional[str]:
+async def safe_goto(page, url):
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PRODUCT_TIMEOUT_MS)
-        await page.wait_for_timeout(600)
-        final_url = page.url
-        if not domain_ok(final_url, domain):
-            print("Rejected redirected domain:", url, "->", final_url)
-            return None
-        return final_url
-    except PlaywrightTimeoutError:
-        print("Timeout product:", url)
-        return None
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+        await page.wait_for_timeout(1200)
+        return True
     except Exception as e:
-        print("Product open error:", url, e)
-        return None
+        print("goto failed:", url, str(e)[:120])
+        return False
 
-
-async def confirm_product(context, site: Site, title: str, url: str) -> Optional[dict]:
-    if not domain_ok(url, site.domain):
-        return None
-
-    page = await context.new_page()
+async def get_page_text(page):
     try:
-        final_url = await get_final_same_domain(page, url, site.domain)
-        if not final_url:
-            return None
+        return await page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return ""
 
-        page_title = await page.title()
-        html = await page.content()
-        visible_text = await page.locator("body").inner_text(timeout=5000)
-
-        # On garde d'abord le titre du lien produit. Le <title> de la page contient souvent
-        # des textes génériques et peut faire rejeter de vrais produits.
-        combined_title = re.sub(r"\s+", " ", title).strip()
-        if not valid_title(combined_title) and page_title:
-            combined_title = re.sub(r"\s+", " ", page_title).strip()[:180]
-
-        if not valid_title(combined_title):
-            print("Rejected title:", title[:120], final_url)
-            return None
-
-        if not gaming_relevant(combined_title):
-            print("Rejected basic laptop:", combined_title[:120], final_url)
-            return None
-
-        price = parse_jsonld_price(html) or parse_meta_price(html) or parse_embedded_json_prices(html)
-        if price is None:
-            all_prices = sorted(set(extract_money(visible_text)))
-            if not all_prices:
-                print("No price found:", combined_title[:120], final_url)
-                return None
-            # Ancienne version rejetait si >8 prix. C'était trop strict pour Canada Computers/Best Buy/Dell.
-            # On accepte le plus petit prix plausible, puis les filtres anti-prix impossible font le tri.
-            price = all_prices[0]
-
-        if impossible_price(combined_title, price):
-            print("Rejected impossible price:", price, combined_title[:120], final_url)
-            return None
-
-        if price < MIN_PRICE or price > MAX_PRICE:
-            return None
-
-        return {
-            "title": re.sub(r"\s+", " ", combined_title).strip()[:150],
-            "price": float(price),
-            "site": site.name,
-            "url": normalize_url(final_url),
-            "score": score(combined_title, float(price)),
-        }
-    finally:
-        await page.close()
-
-
-async def collect_candidates(context, site: Site, query: str) -> list[tuple[str, str]]:
-    page = await context.new_page()
-    candidates = []
+async def product_price_and_title(page, fallback_title):
+    # 1) Prefer the visible product title (h1). It is usually safer than link text.
+    title = normalize_title(fallback_title)
     try:
-        search_url = site.search_url.format(q=quote_plus(query))
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=SEARCH_TIMEOUT_MS)
-        await page.wait_for_timeout(900)
+        h1 = await page.locator("h1").first.inner_text(timeout=2000)
+        if h1 and len(h1.strip()) >= 10:
+            title = normalize_title(h1)
+    except Exception:
+        pass
 
-        links = await page.locator("a[href]").evaluate_all("""
+    # 2) JSON-LD is the safest source when available because it belongs to the product.
+    try:
+        scripts = await page.locator('script[type="application/ld+json"]').all_text_contents()
+        for raw in scripts:
+            try:
+                data = json.loads(raw)
+                stack = data if isinstance(data, list) else [data]
+                stack = list(stack)
+                while stack:
+                    item = stack.pop()
+                    if isinstance(item, list):
+                        stack.extend(item)
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+
+                    item_title = item.get("name") or title
+                    offer = item.get("offers")
+                    if isinstance(offer, list):
+                        stack.extend(offer)
+                    elif isinstance(offer, dict):
+                        price = offer.get("price") or offer.get("lowPrice")
+                        if price:
+                            try:
+                                p = float(str(price).replace(",", ""))
+                                if MIN_PRICE <= p <= MAX_PRICE:
+                                    return normalize_title(item_title), p
+                            except Exception:
+                                pass
+
+                    for v in item.values():
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 3) Meta product price is also relatively safe.
+    meta_selectors = [
+        'meta[property="product:price:amount"]',
+        'meta[property="og:price:amount"]',
+        'meta[itemprop="price"]',
+    ]
+    for sel in meta_selectors:
+        try:
+            content = await page.locator(sel).first.get_attribute("content", timeout=1200)
+            if content:
+                p = float(str(content).replace(",", ""))
+                if MIN_PRICE <= p <= MAX_PRICE:
+                    return title, p
+        except Exception:
+            pass
+
+    # 4) Fallback: scan only likely product containers, not the whole page first.
+    # This avoids taking a price from recommended products lower on the page.
+    container_selectors = [
+        '[itemtype*="Product"]',
+        '[data-testid*="product"]',
+        '[class*="product-detail"]',
+        '[class*="productDetail"]',
+        '[class*="product-page"]',
+        '[class*="productPage"]',
+        '[class*="product-info"]',
+        '[class*="productInfo"]',
+        '#productDetails',
+        '#product-summary',
+        'main',
+    ]
+    for sel in container_selectors:
+        try:
+            loc = page.locator(sel).first
+            txt = await loc.inner_text(timeout=2000)
+            prices = extract_prices(txt)
+            prices = sorted(set(prices))
+            if 1 <= len(prices) <= 4:
+                return title, prices[0]
+        except Exception:
+            pass
+
+    # 5) Last resort: use visible price selectors, but reject noisy pages.
+    price_selectors = [
+        '[data-testid*="price"]',
+        '[class*="sale-price"]',
+        '[class*="salePrice"]',
+        '[class*="current-price"]',
+        '[class*="currentPrice"]',
+        '[class*="product-price"]',
+        '[class*="productPrice"]',
+        '[id*="price"]',
+        '.price',
+    ]
+    all_prices = []
+    for sel in price_selectors:
+        try:
+            vals = await page.locator(sel).all_text_contents()
+            for v in vals[:8]:
+                all_prices.extend(extract_prices(v))
+        except Exception:
+            pass
+
+    all_prices = sorted(set(all_prices))
+    if 1 <= len(all_prices) <= 4:
+        return title, all_prices[0]
+
+    # Do not scan the full body if there are too many prices; it causes false deals.
+    return title, None
+
+async def collect_candidate_links(page, search_url, domain, hints):
+    try:
+        anchors = await page.locator("a[href]").evaluate_all("""
             els => els.map(a => ({href: a.href, text: (a.innerText || a.textContent || '').trim()}))
         """)
+    except Exception:
+        anchors = []
+    links = []
+    seen = set()
+    for a in anchors:
+        url = clean_url(search_url, a.get("href"), domain)
+        title = normalize_title(a.get("text"))
+        if not url or url in seen:
+            continue
+        if not looks_product_url(url, hints):
+            continue
+        if not valid_title(title):
+            continue
+        seen.add(url)
+        links.append((title, url))
+        if len(links) >= MAX_PRODUCTS_PER_SITE:
+            break
+    return links
 
-        seen = set()
-        for item in links:
-            href = normalize_url(item.get("href", ""))
-            text = re.sub(r"\s+", " ", item.get("text", "")).strip()
-            if not href or href in seen:
-                continue
-            seen.add(href)
-            if not domain_ok(href, site.domain):
-                continue
-            if not valid_title(text):
-                continue
-            candidates.append((text, href))
-            if len(candidates) >= 8:
-                break
+async def scrape_site(browser, site_name, cfg):
+    stats = {"tested": 0, "confirmed": 0, "rejected": 0, "errors": 0}
+    deals = []
+
+    async def inner():
+        context = await browser.new_context(locale="en-CA", user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36", viewport={"width": 1365, "height": 900})
+        page = await context.new_page()
+        try:
+            candidates = []
+            seen_urls = set()
+            for q in QUERIES:
+                search_url = cfg["search"].format(q=quote_plus(q))
+                if not await safe_goto(page, search_url):
+                    stats["errors"] += 1
+                    continue
+                found = await collect_candidate_links(page, search_url, cfg["domain"], cfg["product_hints"])
+                for title, url in found:
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        candidates.append((title, url))
+                if len(candidates) >= MAX_PRODUCTS_PER_SITE:
+                    break
+            print(f"[{site_name}] candidates={len(candidates)}")
+            for fallback_title, url in candidates[:MAX_PRODUCTS_PER_SITE]:
+                stats["tested"] += 1
+                if not await safe_goto(page, url):
+                    stats["errors"] += 1
+                    continue
+                final_url = page.url
+                if not same_domain(final_url, cfg["domain"]):
+                    stats["rejected"] += 1
+                    print(f"[{site_name}] rejected external redirect {final_url}")
+                    continue
+                title, price = await product_price_and_title(page, fallback_title)
+                if price is None:
+                    stats["rejected"] += 1
+                    print(f"[{site_name}] rejected no price: {title[:80]}")
+                    continue
+                if not realistic_price(title, price, cfg.get("strict", False)):
+                    stats["rejected"] += 1
+                    print(f"[{site_name}] rejected unrealistic/basic: {price} {title[:100]}")
+                    continue
+                stats["confirmed"] += 1
+                deals.append({"title": title, "price": price, "site": site_name, "url": final_url.split("?")[0], "score": score_deal(title, price)})
+        finally:
+            await context.close()
+
+    try:
+        await asyncio.wait_for(inner(), timeout=SITE_TIMEOUT)
+    except asyncio.TimeoutError:
+        stats["errors"] += 1
+        print(f"[{site_name}] timeout site")
     except Exception as e:
-        print(f"[{site.name}] search error for {query}: {e}")
-    finally:
-        await page.close()
-    return candidates
+        stats["errors"] += 1
+        print(f"[{site_name}] error: {e}")
+    return deals, stats
 
-
-async def scrape_site(context, site: Site) -> tuple[list[dict], int]:
-    confirmed = []
-    tested = 0
-    seen_urls = set()
-
-    for query in QUERIES:
-        candidates = await collect_candidates(context, site, query)
-        for title, url in candidates:
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-            tested += 1
-            deal = await confirm_product(context, site, title, url)
-            if deal:
-                confirmed.append(deal)
-                if len(confirmed) >= MAX_RESULTS_PER_SITE:
-                    return confirmed, tested
-    return confirmed, tested
-
-
-async def run_bot() -> None:
+async def run():
     seen = load_seen()
     all_deals = []
-    stats = {}
-
+    all_stats = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
-        context = await browser.new_context(
-            locale="en-CA",
-            timezone_id="America/Toronto",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        )
-
-        async def block_unneeded(route):
-            if route.request.resource_type in {"image", "font", "media"}:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await context.route("**/*", block_unneeded)
-
-        for site in SITES:
-            print("Checking", site.name, flush=True)
-            try:
-                deals, tested = await asyncio.wait_for(scrape_site(context, site), timeout=SITE_TIMEOUT_SECONDS)
-                stats[site.name] = {"confirmed": len(deals), "tested": tested}
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        try:
+            for site_name, cfg in SITES.items():
+                deals, stats = await scrape_site(browser, site_name, cfg)
                 all_deals.extend(deals)
-                print(f"Done {site.name}: {len(deals)} confirmed, {tested} tested", flush=True)
-            except asyncio.TimeoutError:
-                stats[site.name] = {"confirmed": 0, "tested": 0}
-                print(f"Timeout site {site.name} after {SITE_TIMEOUT_SECONDS}s", flush=True)
-            except Exception as e:
-                stats[site.name] = {"confirmed": 0, "tested": 0}
-                print(f"Error site {site.name}: {e}", flush=True)
+                all_stats[site_name] = stats
+        finally:
+            await browser.close()
 
-        await browser.close()
-
-    unique = {}
+    unique = []
+    used = set()
     for d in all_deals:
-        unique[d["url"]] = d
+        if d["url"] in used:
+            continue
+        used.add(d["url"])
+        unique.append(d)
+    unique.sort(key=lambda x: (-x["score"], x["price"]))
 
-    deals = sorted(unique.values(), key=lambda x: (-x["score"], x["price"]))
-    new_deals = []
-    for d in deals:
+    new = []
+    for d in unique:
         if d["url"] not in seen:
-            new_deals.append(d)
-            seen.add(d["url"])
+            new.append(d)
+            seen.append(d["url"])
 
-    save_seen(seen)
-
-    if not new_deals:
-        msg = f"Aucun nouveau deal fiable trouvé entre {MIN_PRICE:.0f}$ et {MAX_PRICE:.0f}$ CAD.\n\n"
-        msg += "Sites vérifiés ce run:\n"
-        for name, s in stats.items():
-            msg += f"- {name}: {s['confirmed']} confirmés, {s['tested']} liens testés\n"
+    if not new:
+        msg = "Aucun nouveau vrai deal confirmé cette fois.\n\nSites vérifiés ce run:\n"
+        for site, st in all_stats.items():
+            msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\n"
         send_telegram(msg)
+        save_seen(seen)
         return
 
-    msg = f"🔥 Deals laptops fiables Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\n\n"
-    for i, d in enumerate(new_deals[:MAX_TOTAL_DEALS], 1):
-        msg += (
-            f"{i}. {d['title']}\n"
-            f"💲 {d['price']:.2f} CAD\n"
-            f"🏬 {d['site']}\n"
-            f"⭐ Score: {d['score']}\n"
-            f"🔗 {d['url']}\n\n"
-        )
-
+    msg = f"🔥 Deals laptops confirmés Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\n\n"
+    for i, d in enumerate(new[:MAX_RESULTS_TO_SEND], 1):
+        msg += f"{i}. {d['title']}\n💲 {d['price']:.2f} CAD confirmé\n🏬 {d['site']}\n⭐ Score: {d['score']}\n🔗 {d['url']}\n\n"
     msg += "Sites vérifiés ce run:\n"
-    for name, s in stats.items():
-        msg += f"- {name}: {s['confirmed']} confirmés, {s['tested']} liens testés\n"
-    msg += "\nPrix filtrés contre les valeurs impossibles. Vérifie toujours taxes, stock Montréal et Open Box."
-
+    for site, st in all_stats.items():
+        msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\n"
+    msg += "\nPrix vérifié sur la page produit. Vérifie quand même taxes, stock Montréal et condition Open Box."
     send_telegram(msg)
-
+    save_seen(seen)
 
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(run())
