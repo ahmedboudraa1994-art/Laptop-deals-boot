@@ -29,49 +29,19 @@ QUERIES = [
 ]
 
 SITE_QUERIES = {
-    "Canada Computers": [
-        "rtx 4060 laptop", "rtx 4050 laptop", "gaming laptop", "asus tuf",
-        "lenovo legion", "lenovo loq", "acer nitro", "msi katana", "hp victus"
-    ],
-    "Best Buy Canada": [
-        "rtx 4060 laptop", "rtx 4050 laptop", "gaming laptop", "lenovo legion",
-        "asus tuf", "acer nitro", "hp victus", "dell g15", "msi katana"
-    ],
-    "Memory Express": [
-        "rtx 4060 laptop", "rtx 4050 laptop", "gaming notebook", "lenovo legion",
-        "asus tuf", "acer nitro", "msi katana", "gigabyte g6"
-    ],
-    "Newegg Canada": [
-        "rtx 4060 laptop", "rtx 4050 laptop", "gaming laptop", "lenovo legion",
-        "asus tuf", "acer nitro", "msi katana", "hp victus"
-    ],
-    "Staples Canada": [
-        "gaming laptop", "rtx laptop", "lenovo legion", "asus tuf", "acer nitro", "hp victus"
-    ],
-    "Walmart Canada": [
-        "gaming laptop", "rtx laptop", "lenovo legion", "asus tuf", "acer nitro", "msi gaming laptop"
-    ],
-    "Costco Canada": [
-        "gaming laptop", "rtx laptop", "lenovo legion", "hp victus", "asus tuf", "msi laptop"
-    ],
-    "Lenovo Canada": [
-        "Legion", "LOQ", "RTX 4060", "RTX 4050", "gaming laptop", "Legion 5", "LOQ 15"
-    ],
-    "Dell Canada": [
-        "G15", "G16", "Alienware", "RTX 4060", "RTX 4050", "gaming laptop"
-    ],
-    "HP Canada": [
-        "Victus", "Omen", "RTX 4060", "RTX 4050", "gaming laptop"
-    ],
-    "ASUS Canada": [
-        "TUF", "ROG", "RTX 4060", "RTX 4050", "gaming laptop"
-    ],
-    "Acer Canada": [
-        "Nitro", "Predator", "RTX 4060", "RTX 4050", "gaming laptop"
-    ],
-    "MSI Canada": [
-        "Katana", "Thin", "Cyborg", "RTX 4060", "RTX 4050", "gaming laptop"
-    ],
+    "Canada Computers": ["rtx 4060 laptop", "rtx 4050 laptop", "rtx 5060 laptop", "gaming laptop", "asus tuf", "lenovo legion", "lenovo loq", "acer nitro", "msi katana", "hp victus", "dell g15", "gigabyte a16"],
+    "Best Buy Canada": ["rtx 4060 laptop", "rtx 4050 laptop", "gaming laptop", "lenovo legion", "asus tuf", "acer nitro", "hp victus", "dell g15", "msi katana", "asus rog", "lenovo loq"],
+    "Memory Express": ["rtx 4060 laptop", "rtx 4050 laptop", "gaming notebook", "lenovo legion", "asus tuf", "acer nitro", "msi katana", "gigabyte g6", "hp victus"],
+    "Newegg Canada": ["rtx 4060 laptop", "rtx 4050 laptop", "gaming laptop", "lenovo legion", "asus tuf", "acer nitro", "msi katana", "hp victus", "dell g15"],
+    "Staples Canada": ["gaming laptop", "rtx laptop", "lenovo legion", "asus tuf", "acer nitro", "hp victus", "msi gaming laptop"],
+    "Walmart Canada": ["gaming laptop", "rtx laptop", "lenovo legion", "asus tuf", "acer nitro", "msi gaming laptop", "hp victus"],
+    "Costco Canada": ["gaming laptop", "rtx laptop", "lenovo legion", "hp victus", "asus tuf", "msi laptop", "acer nitro"],
+    "Lenovo Canada": ["Legion", "LOQ", "RTX 4060", "RTX 4050", "gaming laptop", "Legion 5", "LOQ 15", "Legion Slim"],
+    "Dell Canada": ["G15", "G16", "Alienware", "RTX 4060", "RTX 4050", "gaming laptop"],
+    "HP Canada": ["Victus", "Omen", "RTX 4060", "RTX 4050", "gaming laptop"],
+    "ASUS Canada": ["TUF", "ROG", "RTX 4060", "RTX 4050", "gaming laptop"],
+    "Acer Canada": ["Nitro", "Predator", "RTX 4060", "RTX 4050", "gaming laptop"],
+    "MSI Canada": ["Katana", "Thin", "Cyborg", "RTX 4060", "RTX 4050", "gaming laptop"],
 }
 
 MAX_QUERIES_PER_SITE = 999
@@ -114,6 +84,9 @@ BAD_PAGE_TEXT = [
     "not sold online",
     "not available for delivery",
     "not available in your area",
+    "please verify",
+    "human verification",
+    "automated access",
 ]
 CATEGORY_TITLES = {"gaming laptops", "laptops", "notebooks", "search results", "laptop computers", "windows laptops", "shop laptops", "pc laptops"}
 BAD_WORDS = ["desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook", "screen protector"]
@@ -184,16 +157,7 @@ def valid_title(title):
 
 
 def extract_prices(text):
-    values = []
-    for raw in PRICE_RE.findall(text or ""):
-        try:
-            price = float(raw.replace(",", "").replace(" ", ""))
-            if MIN_PRICE <= price <= MAX_PRICE:
-                values.append(price)
-        except Exception:
-            pass
-    return sorted(set(values))
-
+    return extract_prices_loose(text)
 
 def page_is_bad(text, url):
     low = (text or "").lower()
@@ -297,6 +261,52 @@ async def jsonld_price(page, fallback):
     return None, None
 
 
+
+async def script_price(page, fallback):
+    try:
+        scripts = await page.locator("script").all_text_contents()
+    except Exception:
+        scripts = []
+
+    best_title = normalize_title(fallback)
+    prices = []
+
+    for raw in scripts[:80]:
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+            stack = [data]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, list):
+                    stack.extend(item)
+                elif isinstance(item, dict):
+                    name = item.get("name") or item.get("title") or item.get("productName")
+                    if name and valid_title(str(name)):
+                        best_title = normalize_title(str(name))
+
+                    for key in ["price", "salePrice", "finalPrice", "currentPrice", "lowPrice", "value"]:
+                        p = parse_price_value(item.get(key))
+                        if p is not None:
+                            prices.append(p)
+
+                    for v in item.values():
+                        if isinstance(v, (dict, list)):
+                            stack.append(v)
+        except Exception:
+            pass
+
+        prices.extend(extract_prices_loose(raw[:300000]))
+
+    prices = sorted(set(prices))
+    if 1 <= len(prices) <= 10:
+        return best_title, prices[0]
+
+    return None, None
+
+
 async def meta_price(page):
     for sel in ['meta[property="product:price:amount"]', 'meta[property="og:price:amount"]', 'meta[itemprop="price"]']:
         try:
@@ -311,26 +321,59 @@ async def meta_price(page):
 
 
 async def scoped_price(page):
-    selectors = ["main", "#product-page", ".product-page", ".product-detail", ".productDetails", ".product-info", ".product-main", "[data-testid*='product']", "[class*='product']"]
+    selectors = [
+        "[itemtype*='Product']",
+        "[data-testid*='product']",
+        "[data-test*='product']",
+        "[class*='Product']",
+        "[class*='product']",
+        "main",
+        "#product-page",
+        "#productPage",
+        "#pdp",
+        ".pdp",
+        ".product-page",
+        ".product-detail",
+        ".productDetails",
+        ".product-info",
+        ".product-main",
+        ".priceView-hero-price",
+        ".priceView-customer-price",
+        ".pricing",
+        ".productPricing",
+        ".price",
+        "[class*='price']",
+    ]
+
     for sel in selectors:
         try:
-            texts = await page.locator(sel).all_inner_texts(timeout=1500)
+            texts = await page.locator(sel).all_inner_texts(timeout=1800)
         except Exception:
             continue
+
         prices = []
-        for txt in texts[:5]:
-            prices.extend(extract_prices(txt))
+        for txt in texts[:8]:
+            prices.extend(extract_prices_loose(txt))
+
         prices = sorted(set(prices))
-        if 1 <= len(prices) <= 5:
+
+        if 1 <= len(prices) <= 8:
             return prices[0]
+
     return None
 
 
 async def get_product_data(page, fallback_title, strict):
     text = await body_text(page)
     if page_is_bad(text, page.url):
+        snippet = re.sub(r"\s+", " ", (text or ""))[:200]
+        print(f"[antibot-debug] {page.url} -> {snippet!r}")
         return None, None, "bad/unavailable/category/antibot page"
     title, price = await jsonld_price(page, fallback_title)
+    if price is None:
+        s_title, s_price = await script_price(page, fallback_title)
+        if s_price is not None:
+            title, price = s_title, s_price
     if price is None:
         meta = await meta_price(page)
         if meta is not None:
