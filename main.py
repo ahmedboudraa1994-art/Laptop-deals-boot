@@ -47,7 +47,7 @@ SITE_QUERIES = {
 MAX_QUERIES_PER_SITE = 999
 
 SITES = {
-    "Canada Computers": {"domain":"canadacomputers.com", "search":"https://www.canadacomputers.com/en/search?s={q}", "hints":["/en/gaming-laptops/", "/en/windows-laptops/", "/en/laptops/"], "strict":False},
+    "Canada Computers": {"domain":"canadacomputers.com", "search":"https://www.canadacomputers.com/en/search?s={q}", "hints":["/en/gaming-laptops/", "/en/windows-laptops/", "/en/laptops/"], "hint_regex": r"/en/[a-z0-9-]+/\d{4,7}/[a-z0-9-]+\.html", "strict":False},
     "Best Buy Canada": {"domain":"bestbuy.ca", "search":"https://www.bestbuy.ca/en-ca/search?search={q}", "hints":["/en-ca/product/"], "strict":False},
     "Memory Express": {"domain":"memoryexpress.com", "search":"https://www.memoryexpress.com/Search/Products?Search={q}", "hints":["/Products/"], "strict":False},
     "Newegg Canada": {"domain":"newegg.ca", "search":"https://www.newegg.ca/p/pl?d={q}", "hints":["/p/"], "strict":True},
@@ -65,7 +65,7 @@ SITES = {
 BAD_URL_PARTS = [
     "/p/pl", "/p/pl?", "/search", "search?", "catalogsearch", "/category", "/categories",
     "/collection", "/collections", "/deals", "/sale", "/promotions", "/promo", "/clearance",
-    "/gaming-laptops", "/windows-laptops", "/laptops-and-netbooks", "/laptops/pc-laptops",
+    "/laptops-and-netbooks", "/laptops/pc-laptops",
 ]
 BAD_PAGE_TEXT = [
     "sorry this product is not available", "this product is not available", "product is not available",
@@ -320,6 +320,55 @@ async def meta_price(page):
     return None
 
 
+
+def parse_price_value(value):
+    try:
+        if value is None:
+            return None
+        s = str(value)
+        s = s.replace("CAD", "").replace("CA$", "").replace("$", "")
+        s = s.replace(",", "").replace(" ", "").strip()
+        p = float(s)
+        if MIN_PRICE <= p <= MAX_PRICE:
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def extract_prices_loose(text):
+    vals = []
+    text = text or ""
+
+    try:
+        for raw in PRICE_RE.findall(text):
+            p = parse_price_value(raw)
+            if p is not None:
+                vals.append(p)
+    except Exception:
+        pass
+
+    patterns = [
+        r'"price"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'"salePrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'"finalPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'"currentPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'"lowPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'"value"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'price\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'salePrice\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+        r'finalPrice\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
+    ]
+
+    for pat in patterns:
+        for raw in re.findall(pat, text, flags=re.I):
+            p = parse_price_value(raw)
+            if p is not None:
+                vals.append(p)
+
+    return sorted(set(vals))
+
+
 async def scoped_price(page):
     selectors = [
         "[itemtype*='Product']",
@@ -411,7 +460,10 @@ async def collect_links(page, search_url, cfg):
             debug["bad_domain"] += 1; continue
         if is_bad_url(full):
             debug["bad_url"] += 1; continue
-        if not any(h.lower() in full.lower() for h in cfg["hints"]):
+        matches_hint = any(h.lower() in full.lower() for h in cfg["hints"])
+        if not matches_hint and cfg.get("hint_regex"):
+            matches_hint = bool(re.search(cfg["hint_regex"], full, re.I))
+        if not matches_hint:
             debug["bad_hint"] += 1; continue
         if not valid_title(raw_title):
             debug["bad_title"] += 1; continue
