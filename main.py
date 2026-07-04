@@ -1,10 +1,7 @@
-import os
-import re
-import json
-import asyncio
+import os, re, json, asyncio
 from urllib.parse import quote_plus, urlparse, urljoin
-from playwright.async_api import async_playwright
 import requests
+from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -12,8 +9,9 @@ MAX_PRICE = float(os.getenv("MAX_PRICE", "1000"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 SEEN_FILE = "seen_deals.json"
 
-PAGE_TIMEOUT = 9000
-SITE_TIMEOUT = 110
+PAGE_TIMEOUT = 14000
+SITE_TIMEOUT = 240
+MAX_QUERIES_PER_SITE = 4
 MAX_PRODUCTS_PER_SITE = 8
 MAX_RESULTS_TO_SEND = 8
 
@@ -34,86 +32,134 @@ SITES = {
     "Canada Computers": {
         "domain": "canadacomputers.com",
         "search": "https://www.canadacomputers.com/en/search?s={q}",
-        "product_hints": ["/en/gaming-laptops/", "/en/windows-laptops/"],
+        "hints": ["/en/gaming-laptops/", "/en/windows-laptops/"],
         "strict": False,
     },
     "Best Buy Canada": {
         "domain": "bestbuy.ca",
         "search": "https://www.bestbuy.ca/en-ca/search?search={q}",
-        "product_hints": ["/en-ca/product/"],
+        "hints": ["/en-ca/product/"],
         "strict": False,
     },
     "Memory Express": {
         "domain": "memoryexpress.com",
         "search": "https://www.memoryexpress.com/Search/Products?Search={q}",
-        "product_hints": ["/Products/"],
+        "hints": ["/Products/"],
         "strict": False,
     },
     "Newegg Canada": {
         "domain": "newegg.ca",
         "search": "https://www.newegg.ca/p/pl?d={q}",
-        "product_hints": ["/p/"],
+        "hints": ["/p/"],
         "strict": True,
     },
     "Staples Canada": {
         "domain": "staples.ca",
         "search": "https://www.staples.ca/search?query={q}",
-        "product_hints": ["/products/"],
+        "hints": ["/products/"],
         "strict": False,
     },
     "Walmart Canada": {
         "domain": "walmart.ca",
         "search": "https://www.walmart.ca/search?q={q}",
-        "product_hints": ["/ip/"],
+        "hints": ["/ip/"],
         "strict": False,
     },
     "Costco Canada": {
         "domain": "costco.ca",
         "search": "https://www.costco.ca/CatalogSearch?keyword={q}",
-        "product_hints": [".product."],
+        "hints": [".product.", "/products/"],
         "strict": False,
     },
     "Lenovo Canada": {
         "domain": "lenovo.com",
         "search": "https://www.lenovo.com/ca/en/search?text={q}",
-        "product_hints": ["/p/", "/ca/en/p/"],
+        "hints": ["/p/", "/ca/en/p/"],
         "strict": False,
     },
     "Dell Canada": {
         "domain": "dell.com",
         "search": "https://www.dell.com/en-ca/shop/scc/sr?~query={q}",
-        "product_hints": ["/shop/", "/laptops/"],
+        "hints": ["/shop/", "/laptops/"],
         "strict": False,
     },
     "HP Canada": {
         "domain": "hp.com",
         "search": "https://www.hp.com/ca-en/shop/sitesearch?keyword={q}",
-        "product_hints": ["/pdp/", "/shop/"],
+        "hints": ["/pdp/", "/shop/"],
         "strict": False,
     },
     "ASUS Canada": {
         "domain": "asus.com",
         "search": "https://www.asus.com/ca-en/searchresult?searchType=products&searchKey={q}",
-        "product_hints": ["/ca-en/laptops/", "/laptops/"],
+        "hints": ["/ca-en/laptops/", "/laptops/"],
         "strict": False,
     },
     "Acer Canada": {
         "domain": "acer.com",
         "search": "https://www.acer.com/ca-en/search?q={q}",
-        "product_hints": ["/laptops/", "/notebooks/"],
+        "hints": ["/laptops/", "/notebooks/"],
         "strict": False,
     },
     "MSI Canada": {
         "domain": "msi.com",
         "search": "https://ca.msi.com/search/{q}",
-        "product_hints": ["/Laptop/", "/laptop/"],
+        "hints": ["/Laptop/", "/laptop/"],
         "strict": False,
     },
 }
 
-BAD_WORDS = ["desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook"]
-GOOD_WORDS = ["laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "katana", "victus", "omen", "g15", "a16", "thin"]
-PRICE_RE = re.compile(r"(?:CAD|CA\$|\$)\s*([0-9]{3,5}(?:[, ][0-9]{3})*(?:\.[0-9]{2})?)", re.I)
+BAD_URL_PARTS = [
+    "/p/pl", "/p/pl?", "/search", "search?", "catalogsearch", "/category",
+    "/gaming-laptops", "/windows-laptops", "/laptops-and-netbooks",
+    "/collection", "/collections", "/deals", "/sale", "/promotions"
+]
+
+BAD_PAGE_TEXT = [
+    "sorry this product is not available",
+    "this product is not available",
+    "product is not available",
+    "product unavailable",
+    "currently unavailable",
+    "out of stock",
+    "sold out",
+    "discontinued",
+    "no longer available",
+    "take me there now",
+    "similar products",
+    "search results",
+    "no more content",
+    "you are here",
+    "captcha",
+    "verify you are human",
+    "verify you're human",
+    "access denied",
+    "unusual traffic",
+    "are you a robot",
+    "robot check",
+    "blocked",
+    "forbidden",
+    "cloudflare",
+    "akamai",
+    "perimeterx",
+]
+
+CATEGORY_TITLES = {
+    "gaming laptops", "laptops", "notebooks", "search results",
+    "laptop computers", "windows laptops", "shop laptops"
+}
+
+BAD_WORDS = [
+    "desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case",
+    "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook"
+]
+
+GOOD_WORDS = [
+    "laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog",
+    "nitro", "katana", "victus", "omen", "g15", "a16", "thin"
+]
+
+PRICE_RE = re.compile(r"(?:cad|ca\$|\$)\s*([0-9]{3,5}(?:[ ,][0-9]{3})*(?:\.[0-9]{2})?)", re.I)
 
 def load_seen():
     try:
@@ -131,25 +177,25 @@ def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram secrets missing")
         return
-    parts = []
     while text:
-        parts.append(text[:3900])
-        text = text[3900:]
-    for part in parts:
+        part, text = text[:3900], text[3900:]
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": part, "disable_web_page_preview": True},
             timeout=20,
         )
-        print("Telegram:", r.status_code, r.text[:200])
+        print("Telegram:", r.status_code, r.text[:160])
 
 def same_domain(url, domain):
     try:
         host = urlparse(url).netloc.lower()
-        domain = domain.lower()
-        return host == domain or host.endswith("." + domain)
+        return host == domain.lower() or host.endswith("." + domain.lower())
     except Exception:
         return False
+
+def is_bad_url(url):
+    u = (url or "").lower()
+    return any(x in u for x in BAD_URL_PARTS)
 
 def clean_url(base, href, domain):
     if not href:
@@ -159,38 +205,48 @@ def clean_url(base, href, domain):
         return None
     if not same_domain(u, domain):
         return None
+    if is_bad_url(u):
+        return None
     return u
 
-def looks_product_url(url, hints):
-    low = url.lower()
-    return any(h.lower() in low for h in hints)
-
 def normalize_title(t):
-    t = re.sub(r"\s+", " ", t or "").strip()
-    return t[:180]
+    return re.sub(r"\s+", " ", t or "").strip()[:180]
+
+def is_category_title(t):
+    low = normalize_title(t).lower()
+    if low in CATEGORY_TITLES:
+        return True
+    return any(low.startswith(x + " |") or low.startswith(x + " -") for x in CATEGORY_TITLES)
 
 def valid_title(title):
-    t = title.lower()
-    if len(t) < 18:
+    t = normalize_title(title).lower()
+    if len(t) < 18 or is_category_title(t):
         return False
     if any(b in t for b in BAD_WORDS):
         return False
     return any(g in t for g in GOOD_WORDS)
 
 def extract_prices(text):
-    text = (text or "").replace(",", "")
-    prices = []
-    for m in PRICE_RE.findall(text):
+    vals = []
+    for m in PRICE_RE.findall(text or ""):
         try:
-            p = float(m.replace(" ", ""))
+            p = float(m.replace(",", "").replace(" ", ""))
             if MIN_PRICE <= p <= MAX_PRICE:
-                prices.append(p)
+                vals.append(p)
         except Exception:
             pass
-    return sorted(set(prices))
+    return sorted(set(vals))
+
+def page_is_bad(text, url):
+    low = (text or "").lower()
+    if is_bad_url(url):
+        return True
+    return any(x in low for x in BAD_PAGE_TEXT)
 
 def realistic_price(title, price, strict=False):
-    t = title.lower()
+    t = normalize_title(title).lower()
+    if is_category_title(t):
+        return False
     if ("rtx 5080" in t or "rtx 5090" in t or "rtx 5070 ti" in t) and price < 1400:
         return False
     if "rtx 5070" in t and price < 1100:
@@ -200,9 +256,9 @@ def realistic_price(title, price, strict=False):
     if not any(x in t for x in ["rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "katana", "victus", "omen", "g15"]):
         return False
     if strict:
-        if not any(x in t for x in ["rtx 4050", "rtx 4060", "rtx 4070", "rtx 5060", "gaming", "legion", "tuf", "nitro", "katana", "victus", "omen"]):
-            return False
         if "gateway" in t or "iris xe" in t or "uhd graphics" in t:
+            return False
+        if not any(x in t for x in ["rtx 4050", "rtx 4060", "rtx 4070", "rtx 5060", "gaming", "legion", "tuf", "nitro", "katana", "victus", "omen"]):
             return False
     return True
 
@@ -213,7 +269,7 @@ def score_deal(title, price):
     if "rtx 4060" in t: s += 38
     if "rtx 5060" in t: s += 36
     if "rtx 4050" in t: s += 22
-    if "i7" in t or "ryzen 7" in t or "ryzen 9" in t or "ultra 7" in t or "ultra 9" in t: s += 15
+    if any(x in t for x in ["i7", "ryzen 7", "ryzen 9", "ultra 7", "ultra 9"]): s += 15
     if "16gb" in t: s += 10
     if "32gb" in t: s += 15
     if "1tb" in t: s += 10
@@ -223,204 +279,195 @@ def score_deal(title, price):
 async def safe_goto(page, url):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(900)
         return True
     except Exception as e:
-        print("goto failed:", url, str(e)[:120])
+        print("goto failed:", url, str(e)[:100])
         return False
 
-async def get_page_text(page):
+async def body_text(page):
     try:
         return await page.locator("body").inner_text(timeout=3000)
     except Exception:
         return ""
 
-async def product_price_and_title(page, fallback_title):
-    # 1) Prefer the visible product title (h1). It is usually safer than link text.
-    title = normalize_title(fallback_title)
+async def page_title(page, fallback):
     try:
-        h1 = await page.locator("h1").first.inner_text(timeout=2000)
-        if h1 and len(h1.strip()) >= 10:
-            title = normalize_title(h1)
+        title = normalize_title(await page.title())
+        if valid_title(title):
+            return title
     except Exception:
         pass
+    return normalize_title(fallback)
 
-    # 2) JSON-LD is the safest source when available because it belongs to the product.
+async def jsonld_price(page, fallback):
     try:
         scripts = await page.locator('script[type="application/ld+json"]').all_text_contents()
-        for raw in scripts:
-            try:
-                data = json.loads(raw)
-                stack = data if isinstance(data, list) else [data]
-                stack = list(stack)
-                while stack:
-                    item = stack.pop()
-                    if isinstance(item, list):
-                        stack.extend(item)
-                        continue
-                    if not isinstance(item, dict):
-                        continue
-
-                    item_title = item.get("name") or title
-                    offer = item.get("offers")
-                    if isinstance(offer, list):
-                        stack.extend(offer)
-                    elif isinstance(offer, dict):
-                        price = offer.get("price") or offer.get("lowPrice")
-                        if price:
-                            try:
-                                p = float(str(price).replace(",", ""))
-                                if MIN_PRICE <= p <= MAX_PRICE:
-                                    return normalize_title(item_title), p
-                            except Exception:
-                                pass
-
-                    for v in item.values():
-                        if isinstance(v, (dict, list)):
-                            stack.append(v)
-            except Exception:
-                continue
     except Exception:
-        pass
+        scripts = []
+    for raw in scripts:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, list):
+                stack.extend(item)
+            elif isinstance(item, dict):
+                name = normalize_title(item.get("name") or fallback)
+                offer = item.get("offers")
+                if isinstance(offer, list):
+                    stack.extend(offer)
+                elif isinstance(offer, dict):
+                    price = offer.get("price") or offer.get("lowPrice")
+                    try:
+                        p = float(str(price).replace(",", ""))
+                        if MIN_PRICE <= p <= MAX_PRICE and valid_title(name):
+                            return name, p
+                    except Exception:
+                        pass
+                for v in item.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+    return None, None
 
-    # 3) Meta product price is also relatively safe.
-    meta_selectors = [
+async def meta_price(page):
+    selectors = [
         'meta[property="product:price:amount"]',
         'meta[property="og:price:amount"]',
         'meta[itemprop="price"]',
     ]
-    for sel in meta_selectors:
+    for sel in selectors:
         try:
-            content = await page.locator(sel).first.get_attribute("content", timeout=1200)
-            if content:
-                p = float(str(content).replace(",", ""))
+            c = await page.locator(sel).get_attribute("content", timeout=1000)
+            if c:
+                p = float(c.replace(",", ""))
                 if MIN_PRICE <= p <= MAX_PRICE:
-                    return title, p
+                    return p
         except Exception:
             pass
+    return None
 
-    # 4) Fallback: scan only likely product containers, not the whole page first.
-    # This avoids taking a price from recommended products lower on the page.
-    container_selectors = [
-        '[itemtype*="Product"]',
-        '[data-testid*="product"]',
-        '[class*="product-detail"]',
-        '[class*="productDetail"]',
-        '[class*="product-page"]',
-        '[class*="productPage"]',
-        '[class*="product-info"]',
-        '[class*="productInfo"]',
-        '#productDetails',
-        '#product-summary',
-        'main',
+async def scoped_prices(page):
+    selectors = [
+        "main", "#product-page", ".product-page", ".product-detail", ".productDetails",
+        ".product-info", ".product-main", "[data-testid*='product']"
     ]
-    for sel in container_selectors:
+    for sel in selectors:
         try:
-            loc = page.locator(sel).first
-            txt = await loc.inner_text(timeout=2000)
-            prices = extract_prices(txt)
+            txts = await page.locator(sel).all_inner_texts(timeout=1500)
+            prices = []
+            for t in txts[:4]:
+                prices.extend(extract_prices(t))
             prices = sorted(set(prices))
-            if 1 <= len(prices) <= 4:
-                return title, prices[0]
+            if 1 <= len(prices) <= 5:
+                return prices[0]
         except Exception:
             pass
+    return None
 
-    # 5) Last resort: use visible price selectors, but reject noisy pages.
-    price_selectors = [
-        '[data-testid*="price"]',
-        '[class*="sale-price"]',
-        '[class*="salePrice"]',
-        '[class*="current-price"]',
-        '[class*="currentPrice"]',
-        '[class*="product-price"]',
-        '[class*="productPrice"]',
-        '[id*="price"]',
-        '.price',
-    ]
-    all_prices = []
-    for sel in price_selectors:
-        try:
-            vals = await page.locator(sel).all_text_contents()
-            for v in vals[:8]:
-                all_prices.extend(extract_prices(v))
-        except Exception:
-            pass
+async def get_product_data(page, fallback_title, strict):
+    text = await body_text(page)
+    if page_is_bad(text, page.url):
+        return None, None, "bad/unavailable/category/antibot page"
 
-    all_prices = sorted(set(all_prices))
-    if 1 <= len(all_prices) <= 4:
-        return title, all_prices[0]
+    title, price = await jsonld_price(page, fallback_title)
+    if price is None:
+        meta = await meta_price(page)
+        if meta is not None:
+            title = await page_title(page, fallback_title)
+            price = meta
 
-    # Do not scan the full body if there are too many prices; it causes false deals.
-    return title, None
+    if price is None:
+        scoped = await scoped_prices(page)
+        if scoped is not None:
+            title = await page_title(page, fallback_title)
+            price = scoped
 
-async def collect_candidate_links(page, search_url, domain, hints):
+    if price is None:
+        return None, None, "no reliable price"
+
+    if not valid_title(title):
+        return None, None, "bad/category title"
+
+    if not realistic_price(title, price, strict):
+        return None, None, f"unrealistic/basic price {price}"
+
+    return title, price, "ok"
+
+async def collect_links(page, search_url, cfg):
     try:
         anchors = await page.locator("a[href]").evaluate_all("""
             els => els.map(a => ({href: a.href, text: (a.innerText || a.textContent || '').trim()}))
         """)
     except Exception:
         anchors = []
-    links = []
-    seen = set()
+    out, seen = [], set()
     for a in anchors:
-        url = clean_url(search_url, a.get("href"), domain)
+        url = clean_url(search_url, a.get("href"), cfg["domain"])
         title = normalize_title(a.get("text"))
         if not url or url in seen:
             continue
-        if not looks_product_url(url, hints):
+        if not any(h.lower() in url.lower() for h in cfg["hints"]):
             continue
         if not valid_title(title):
             continue
         seen.add(url)
-        links.append((title, url))
-        if len(links) >= MAX_PRODUCTS_PER_SITE:
+        out.append((title, url))
+        if len(out) >= MAX_PRODUCTS_PER_SITE:
             break
-    return links
+    return out
 
 async def scrape_site(browser, site_name, cfg):
     stats = {"tested": 0, "confirmed": 0, "rejected": 0, "errors": 0}
     deals = []
 
     async def inner():
-        context = await browser.new_context(locale="en-CA", user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36", viewport={"width": 1365, "height": 900})
+        context = await browser.new_context(
+            locale="en-CA",
+            viewport={"width": 1365, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        )
         page = await context.new_page()
         try:
-            candidates = []
-            seen_urls = set()
-            for q in QUERIES:
+            candidates, used = [], set()
+            for q in QUERIES[:MAX_QUERIES_PER_SITE]:
                 search_url = cfg["search"].format(q=quote_plus(q))
                 if not await safe_goto(page, search_url):
                     stats["errors"] += 1
                     continue
-                found = await collect_candidate_links(page, search_url, cfg["domain"], cfg["product_hints"])
-                for title, url in found:
-                    if url not in seen_urls:
-                        seen_urls.add(url)
+                for title, url in await collect_links(page, search_url, cfg):
+                    if url not in used:
+                        used.add(url)
                         candidates.append((title, url))
                 if len(candidates) >= MAX_PRODUCTS_PER_SITE:
                     break
+
             print(f"[{site_name}] candidates={len(candidates)}")
-            for fallback_title, url in candidates[:MAX_PRODUCTS_PER_SITE]:
+            for fallback, url in candidates[:MAX_PRODUCTS_PER_SITE]:
                 stats["tested"] += 1
                 if not await safe_goto(page, url):
                     stats["errors"] += 1
                     continue
-                final_url = page.url
-                if not same_domain(final_url, cfg["domain"]):
+                if not same_domain(page.url, cfg["domain"]) or is_bad_url(page.url):
                     stats["rejected"] += 1
-                    print(f"[{site_name}] rejected external redirect {final_url}")
+                    print(f"[{site_name}] reject url {page.url}")
                     continue
-                title, price = await product_price_and_title(page, fallback_title)
-                if price is None:
+                title, price, reason = await get_product_data(page, fallback, cfg.get("strict", False))
+                if reason != "ok":
                     stats["rejected"] += 1
-                    print(f"[{site_name}] rejected no price: {title[:80]}")
-                    continue
-                if not realistic_price(title, price, cfg.get("strict", False)):
-                    stats["rejected"] += 1
-                    print(f"[{site_name}] rejected unrealistic/basic: {price} {title[:100]}")
+                    print(f"[{site_name}] reject {reason}: {fallback[:80]}")
                     continue
                 stats["confirmed"] += 1
-                deals.append({"title": title, "price": price, "site": site_name, "url": final_url.split("?")[0], "score": score_deal(title, price)})
+                deals.append({
+                    "title": title,
+                    "price": price,
+                    "site": site_name,
+                    "url": page.url.split("?")[0],
+                    "score": score_deal(title, price),
+                })
         finally:
             await context.close()
 
@@ -428,28 +475,26 @@ async def scrape_site(browser, site_name, cfg):
         await asyncio.wait_for(inner(), timeout=SITE_TIMEOUT)
     except asyncio.TimeoutError:
         stats["errors"] += 1
-        print(f"[{site_name}] timeout site")
+        print(f"[{site_name}] site timeout")
     except Exception as e:
         stats["errors"] += 1
-        print(f"[{site_name}] error: {e}")
+        print(f"[{site_name}] error {e}")
     return deals, stats
 
 async def run():
     seen = load_seen()
-    all_deals = []
-    all_stats = {}
+    all_deals, all_stats = [], {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         try:
-            for site_name, cfg in SITES.items():
-                deals, stats = await scrape_site(browser, site_name, cfg)
+            for name, cfg in SITES.items():
+                deals, stats = await scrape_site(browser, name, cfg)
                 all_deals.extend(deals)
-                all_stats[site_name] = stats
+                all_stats[name] = stats
         finally:
             await browser.close()
 
-    unique = []
-    used = set()
+    unique, used = [], set()
     for d in all_deals:
         if d["url"] in used:
             continue
@@ -464,20 +509,16 @@ async def run():
             seen.append(d["url"])
 
     if not new:
-        msg = "Aucun nouveau vrai deal confirmé cette fois.\n\nSites vérifiés ce run:\n"
-        for site, st in all_stats.items():
-            msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\n"
-        send_telegram(msg)
-        save_seen(seen)
-        return
+        msg = "Aucun nouveau vrai deal confirmé cette fois.\\n\\nSites vérifiés ce run:\\n"
+    else:
+        msg = f"🔥 Deals laptops confirmés Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\\n\\n"
+        for i, d in enumerate(new[:MAX_RESULTS_TO_SEND], 1):
+            msg += f"{i}. {d['title']}\\n💲 {d['price']:.2f} CAD confirmé\\n🏬 {d['site']}\\n⭐ Score: {d['score']}\\n🔗 {d['url']}\\n\\n"
+        msg += "Sites vérifiés ce run:\\n"
 
-    msg = f"🔥 Deals laptops confirmés Canada {MIN_PRICE:.0f}$–{MAX_PRICE:.0f}$ CAD\n\n"
-    for i, d in enumerate(new[:MAX_RESULTS_TO_SEND], 1):
-        msg += f"{i}. {d['title']}\n💲 {d['price']:.2f} CAD confirmé\n🏬 {d['site']}\n⭐ Score: {d['score']}\n🔗 {d['url']}\n\n"
-    msg += "Sites vérifiés ce run:\n"
     for site, st in all_stats.items():
-        msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\n"
-    msg += "\nPrix vérifié sur la page produit. Vérifie quand même taxes, stock Montréal et condition Open Box."
+        msg += f"- {site}: {st['confirmed']} confirmés, {st['tested']} testés, {st['rejected']} rejetés, {st['errors']} erreurs\\n"
+    msg += "\\nPrix vérifié sur fiche produit disponible. Vérifie quand même taxes, stock Montréal et Open Box."
     send_telegram(msg)
     save_seen(seen)
 
