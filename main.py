@@ -9,13 +9,13 @@ from playwright.async_api import async_playwright
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-MAX_PRICE = float(os.getenv("MAX_PRICE", "1000"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "1200"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "600"))
 SEEN_FILE = "seen_deals.json"
 
-PAGE_TIMEOUT = 14000
+PAGE_TIMEOUT = 25000
 SITE_TIMEOUT = 240
-MAX_PRODUCTS_PER_SITE = 10
+MAX_PRODUCTS_PER_SITE = 25
 MAX_RESULTS_TO_SEND = 8
 DEBUG_IN_TELEGRAM = True
 
@@ -90,7 +90,17 @@ BAD_PAGE_TEXT = [
 ]
 CATEGORY_TITLES = {"gaming laptops", "laptops", "notebooks", "search results", "laptop computers", "windows laptops", "shop laptops", "pc laptops"}
 BAD_WORDS = ["desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook", "screen protector"]
-GOOD_WORDS = ["laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "predator", "katana", "thin", "cyborg", "victus", "omen", "g15", "g16", "a16", "gigabyte"]
+GOOD_WORDS = ["laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "predator", "katana", "thin", "cyborg", "victus", "omen", "gigabyte"]
+# short model codes like "g15"/"g16"/"a16" are too generic on their own (they collide with
+# unrelated product codes, e.g. Ray-Ban's "G15" lens tint) -- only count them with brand context
+BRAND_MODEL_PATTERNS = [
+    re.compile(r"\bdell\s*g1[56]\b", re.I),
+    re.compile(r"\bgigabyte\s*a16\b", re.I),
+]
+
+
+def has_brand_model_match(t):
+    return any(p.search(t) for p in BRAND_MODEL_PATTERNS)
 PRICE_RE = re.compile(r"(?:cad|ca\$|\$)\s*([0-9]{1,3}(?:[ ,][0-9]{3})+(?:\.[0-9]{2})?|[0-9]{3,5}(?:\.[0-9]{2})?)", re.I)
 
 
@@ -160,7 +170,36 @@ def valid_title(title):
         return False
     if any(b in t for b in BAD_WORDS):
         return False
-    return any(g in t for g in GOOD_WORDS)
+    return any(g in t for g in GOOD_WORDS) or has_brand_model_match(t)
+
+
+def title_from_url(url):
+    """Build a usable fallback title from the product URL slug when anchor text is empty
+    or generic (common on Best Buy, Newegg, Lenovo, HP, ASUS).
+    """
+    try:
+        path = urlparse(url).path.strip("/")
+        parts = [p for p in path.split("/") if p]
+        # Prefer a long slug near the end; skip numeric ids and generic folders.
+        for part in reversed(parts):
+            clean = re.sub(r"[-_]+", " ", part)
+            clean = re.sub(r"\.html?$", "", clean, flags=re.I)
+            clean = normalize_title(clean)
+            if len(clean) >= 18 and not clean.isdigit() and clean.lower() not in CATEGORY_TITLES:
+                return clean
+    except Exception:
+        pass
+    return ""
+
+
+def candidate_title(raw_title, url):
+    raw_title = normalize_title(raw_title)
+    if valid_title(raw_title):
+        return raw_title
+    slug = title_from_url(url)
+    if valid_title(slug):
+        return slug
+    return raw_title or slug
 
 
 def extract_prices(text):
@@ -186,7 +225,7 @@ def realistic_price(title, price, strict=False):
         return False
     if "rtx 5060" in t and price < 750:
         return False
-    if not any(x in t for x in ["rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "predator", "katana", "thin", "cyborg", "victus", "omen", "g15", "g16"]):
+    if not any(x in t for x in ["rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "predator", "katana", "thin", "cyborg", "victus", "omen"]) and not has_brand_model_match(t):
         return False
     if strict:
         if "gateway" in t or "iris xe" in t or "uhd graphics" in t:
@@ -214,7 +253,7 @@ def score_deal(title, price):
 async def safe_goto(page, url):
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        await page.wait_for_timeout(1200)
+        await page.wait_for_timeout(3000)
         return True
     except Exception as e:
         print("goto failed:", url, str(e)[:120])
@@ -312,8 +351,11 @@ async def script_price(page, fallback):
 
         prices.extend(extract_prices_loose(raw[:300000]))
 
-    prices = sorted(set(prices))
-    if 1 <= len(prices) <= 10:
+    # Scripts often contain financing/monthly prices, warranty prices, and old prices.
+    # Keep only prices in our configured range, then avoid pages with too many
+    # different in-range prices because that usually means a listing/carousel, not one product.
+    prices = sorted(set(p for p in prices if MIN_PRICE <= p <= MAX_PRICE))
+    if 1 <= len(prices) <= 12:
         return best_title, prices[0]
 
     return None, None
@@ -522,15 +564,16 @@ async def collect_links(page, search_url, cfg):
             if len(debug["sample_bad_hint"]) < 3:
                 debug["sample_bad_hint"].append(full[:100])
             continue
-        if not valid_title(raw_title):
+        fallback_title = candidate_title(raw_title, full)
+        if not valid_title(fallback_title):
             debug["bad_title"] += 1
             if len(debug["sample_bad_title"]) < 3:
-                debug["sample_bad_title"].append(f"{raw_title[:60]!r} -> {full[:80]}")
+                debug["sample_bad_title"].append(f"{raw_title[:60]!r} / slug={title_from_url(full)[:60]!r} -> {full[:80]}")
             continue
         if full in seen:
             continue
         seen.add(full)
-        results.append((raw_title, full))
+        results.append((fallback_title, full))
         debug["kept"] += 1
         if len(results) >= MAX_PRODUCTS_PER_SITE:
             break
