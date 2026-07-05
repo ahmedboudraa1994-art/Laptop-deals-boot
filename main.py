@@ -454,9 +454,9 @@ async def scoped_price(page):
 async def get_product_data(page, fallback_title, strict):
     text = await body_text(page)
     if page_is_bad(text, page.url):
-        snippet = re.sub(r"\s+", " ", (text or ""))[:200]
+        snippet = re.sub(r"\s+", " ", (text or ""))[:150]
         print(f"[antibot-debug] {page.url} -> {snippet!r}")
-        return None, None, "bad/unavailable/category/antibot page"
+        return None, None, "bad/unavailable/category/antibot page", snippet
     title, price = await jsonld_price(page, fallback_title)
     if price is None:
         s_title, s_price = await script_price(page, fallback_title)
@@ -471,12 +471,12 @@ async def get_product_data(page, fallback_title, strict):
         if scoped is not None:
             title, price = await page_title(page, fallback_title), scoped
     if price is None:
-        return None, None, "no reliable price"
+        return None, None, "no reliable price", fallback_title
     if not valid_title(title):
-        return None, None, "bad/category title"
+        return None, None, "bad/category title", title
     if not realistic_price(title, price, strict):
-        return None, None, f"unrealistic/basic price {price}"
-    return title, price, "ok"
+        return None, None, f"unrealistic/basic price {price}", title
+    return title, price, "ok", None
 
 
 async def collect_links(page, search_url, cfg):
@@ -527,7 +527,8 @@ async def collect_links(page, search_url, cfg):
 
 
 async def scrape_site(browser, site_name, cfg):
-    stats = {"tested": 0, "confirmed": 0, "rejected": 0, "errors": 0, "links_found": 0, "bad_domain": 0, "bad_url": 0, "bad_hint": 0, "bad_title": 0, "kept_links": 0}
+    stats = {"tested": 0, "confirmed": 0, "rejected": 0, "errors": 0, "links_found": 0, "bad_domain": 0, "bad_url": 0, "bad_hint": 0, "bad_title": 0, "kept_links": 0,
+              "sample_bad_hint": [], "sample_bad_title": [], "antibot_snippet": None, "empty_search_snippet": None, "no_price_example": None}
     reject_reasons, deals = {}, []
     async def inner():
         context = await browser.new_context(locale="en-CA", viewport={"width": 1365, "height": 900}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", extra_http_headers={"Accept-Language":"en-CA,en;q=0.9,fr-CA;q=0.8"})
@@ -547,6 +548,10 @@ async def scrape_site(browser, site_name, cfg):
                 stats["kept_links"] += dbg["kept"]
                 if dbg["sample_bad_hint"] or dbg["sample_bad_title"]:
                     print(f"[sample-reject] [{site_name}] q={q!r} bad_hint examples={dbg['sample_bad_hint']} bad_title examples={dbg['sample_bad_title']}")
+                if len(stats["sample_bad_hint"]) < 3:
+                    stats["sample_bad_hint"].extend(dbg["sample_bad_hint"][:3 - len(stats["sample_bad_hint"])])
+                if len(stats["sample_bad_title"]) < 3:
+                    stats["sample_bad_title"].extend(dbg["sample_bad_title"][:3 - len(stats["sample_bad_title"])])
                 if not links:
                     await page.wait_for_timeout(2500)
                     links, dbg = await collect_links(page, search_url, cfg)
@@ -556,9 +561,10 @@ async def scrape_site(browser, site_name, cfg):
                     stats["bad_hint"] += dbg["bad_hint"]
                     stats["bad_title"] += dbg["bad_title"]
                     stats["kept_links"] += dbg["kept"]
-                    if dbg["anchors"] == 0:
+                    if dbg["anchors"] == 0 and stats["empty_search_snippet"] is None:
                         raw = await body_text(page)
-                        snippet = re.sub(r"\s+", " ", (raw or ""))[:200]
+                        snippet = re.sub(r"\s+", " ", (raw or ""))[:150]
+                        stats["empty_search_snippet"] = snippet
                         print(f"[search-empty-debug] [{site_name}] {page.url} -> {snippet!r}")
                 for title, url in links:
                     if url not in used:
@@ -572,9 +578,13 @@ async def scrape_site(browser, site_name, cfg):
                     stats["errors"] += 1; continue
                 if not same_domain(page.url, cfg["domain"]) or is_bad_url(page.url):
                     stats["rejected"] += 1; reject_reasons["bad url/redirect"] = reject_reasons.get("bad url/redirect", 0) + 1; continue
-                title, price, reason = await get_product_data(page, fallback, cfg.get("strict", False))
+                title, price, reason, ctx = await get_product_data(page, fallback, cfg.get("strict", False))
                 if reason != "ok":
                     stats["rejected"] += 1; reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+                    if reason == "bad/unavailable/category/antibot page" and stats["antibot_snippet"] is None:
+                        stats["antibot_snippet"] = ctx
+                    if reason == "no reliable price" and stats.get("no_price_example") is None:
+                        stats["no_price_example"] = ctx
                     print(f"[{site_name}] reject {reason}: {fallback[:80]}"); continue
                 stats["confirmed"] += 1
                 deals.append({"title": title, "price": price, "site": site_name, "url": page.url.split("?")[0], "score": score_deal(title, price)})
@@ -623,6 +633,26 @@ async def run():
             top = sorted(all_reasons[site].items(), key=lambda x: -x[1])[:2]
             msg += "  rejets: " + ", ".join(f"{k}={v}" for k, v in top) + "\n"
     msg += "\nPrix vérifié sur fiche produit disponible. Vérifie quand même taxes, stock Montréal et Open Box."
+
+    diag = "\n\n🔍 Diagnostic (exemples concrets):\n"
+    has_diag = False
+    for site, st in all_stats.items():
+        lines = []
+        if st.get("sample_bad_hint"):
+            lines.append(f"  bad_hint ex: {st['sample_bad_hint'][:2]}")
+        if st.get("sample_bad_title"):
+            lines.append(f"  bad_title ex: {st['sample_bad_title'][:2]}")
+        if st.get("no_price_example"):
+            lines.append(f"  sans prix ex: {st['no_price_example'][:80]!r}")
+        if st.get("antibot_snippet"):
+            lines.append(f"  page bloquée: {st['antibot_snippet'][:120]!r}")
+        if st.get("empty_search_snippet"):
+            lines.append(f"  recherche vide: {st['empty_search_snippet'][:120]!r}")
+        if lines:
+            has_diag = True
+            diag += f"[{site}]\n" + "\n".join(lines) + "\n"
+    if has_diag:
+        msg += diag
     send_telegram(msg)
     save_seen(seen)
 
