@@ -91,7 +91,7 @@ BAD_PAGE_TEXT = [
 CATEGORY_TITLES = {"gaming laptops", "laptops", "notebooks", "search results", "laptop computers", "windows laptops", "shop laptops", "pc laptops"}
 BAD_WORDS = ["desktop", "monitor", "keyboard", "mouse", "charger", "adapter", "case", "bag", "stand", "dock", "cooler", "chair", "tablet", "chromebook", "screen protector"]
 GOOD_WORDS = ["laptop", "notebook", "rtx", "gaming", "legion", "loq", "tuf", "rog", "nitro", "predator", "katana", "thin", "cyborg", "victus", "omen", "g15", "g16", "a16", "gigabyte"]
-PRICE_RE = re.compile(r"(?:cad|ca\$|\$)\s*([0-9]{3,5}(?:[ ,][0-9]{3})*(?:\.[0-9]{2})?)", re.I)
+PRICE_RE = re.compile(r"(?:cad|ca\$|\$)\s*([0-9]{1,3}(?:[ ,][0-9]{3})+(?:\.[0-9]{2})?|[0-9]{3,5}(?:\.[0-9]{2})?)", re.I)
 
 
 def load_seen():
@@ -140,9 +140,16 @@ def is_bad_url(url):
     return any(x in u for x in BAD_URL_PARTS)
 
 
+GENERIC_LISTING_PATTERNS = re.compile(
+    r"^(all|shop all|view all|browse all|explore all|see all|discover)\b", re.I
+)
+
+
 def is_category_title(title):
     low = normalize_title(title).lower()
     if low in CATEGORY_TITLES:
+        return True
+    if GENERIC_LISTING_PATTERNS.match(low):
         return True
     return any(low.startswith(c + " |") or low.startswith(c + " -") or low.startswith(c + " at ") for c in CATEGORY_TITLES)
 
@@ -369,6 +376,32 @@ def extract_prices_loose(text):
     return sorted(set(vals))
 
 
+def all_prices_any_range(text):
+    """Same regex as extract_prices_loose but without the MIN/MAX filter, used to sanity-check
+    that we're not confirming a decoy price while the real (higher) price sits elsewhere on the page."""
+    vals = []
+    text = text or ""
+    try:
+        for raw in PRICE_RE.findall(text):
+            p = parse_price_value_any_range(raw)
+            if p is not None:
+                vals.append(p)
+    except Exception:
+        pass
+    return vals
+
+
+def parse_price_value_any_range(value):
+    try:
+        if value is None:
+            return None
+        s = str(value).replace("CAD", "").replace("CA$", "").replace("$", "")
+        s = s.replace(",", "").replace(" ", "").strip()
+        return float(s)
+    except Exception:
+        return None
+
+
 async def scoped_price(page):
     selectors = [
         "[itemtype*='Product']",
@@ -401,12 +434,18 @@ async def scoped_price(page):
             continue
 
         prices = []
+        raw_prices = []
         for txt in texts[:8]:
             prices.extend(extract_prices_loose(txt))
+            raw_prices.extend(all_prices_any_range(txt))
 
         prices = sorted(set(prices))
+        much_larger_nearby = any(rp > MAX_PRICE * 1.5 for rp in raw_prices)
 
         if 1 <= len(prices) <= 8:
+            if much_larger_nearby:
+                print(f"[scoped-price-skip] in-range price {prices[0]} ignored: a larger price also found nearby (likely the real price)")
+                continue
             return prices[0]
 
     return None
@@ -507,6 +546,10 @@ async def scrape_site(browser, site_name, cfg):
                     stats["bad_hint"] += dbg["bad_hint"]
                     stats["bad_title"] += dbg["bad_title"]
                     stats["kept_links"] += dbg["kept"]
+                    if dbg["anchors"] == 0:
+                        raw = await body_text(page)
+                        snippet = re.sub(r"\s+", " ", (raw or ""))[:200]
+                        print(f"[search-empty-debug] [{site_name}] {page.url} -> {snippet!r}")
                 for title, url in links:
                     if url not in used:
                         used.add(url); candidates.append((title, url))
