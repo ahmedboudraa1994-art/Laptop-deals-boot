@@ -168,7 +168,12 @@ def extract_prices(text):
 
 def page_is_bad(text, url):
     low = (text or "").lower()
-    return is_bad_url(url) or any(term in low for term in BAD_PAGE_TEXT)
+    if is_bad_url(url):
+        return True, "bad_url"
+    for term in BAD_PAGE_TEXT:
+        if term in low:
+            return True, term
+    return False, None
 
 
 def realistic_price(title, price, strict=False):
@@ -294,7 +299,7 @@ async def script_price(page, fallback):
                     if name and valid_title(str(name)):
                         best_title = normalize_title(str(name))
 
-                    for key in ["price", "salePrice", "finalPrice", "currentPrice", "lowPrice", "value"]:
+                    for key in ["price", "salePrice", "finalPrice", "currentPrice", "lowPrice"]:
                         p = parse_price_value(item.get(key))
                         if p is not None:
                             prices.append(p)
@@ -361,7 +366,6 @@ def extract_prices_loose(text):
         r'"finalPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
         r'"currentPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
         r'"lowPrice"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
-        r'"value"\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
         r'price\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
         r'salePrice\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
         r'finalPrice\s*:\s*"?([0-9]{3,5}(?:\.[0-9]{2})?)"?',
@@ -453,8 +457,15 @@ async def scoped_price(page):
 
 async def get_product_data(page, fallback_title, strict):
     text = await body_text(page)
-    if page_is_bad(text, page.url):
-        snippet = re.sub(r"\s+", " ", (text or ""))[:150]
+    is_bad, matched_term = page_is_bad(text, page.url)
+    if is_bad:
+        clean = re.sub(r"\s+", " ", (text or ""))
+        if matched_term and matched_term != "bad_url":
+            idx = clean.lower().find(matched_term)
+            start = max(0, idx - 40)
+            snippet = f"[matched: {matched_term!r}] ..." + clean[start:start + 150]
+        else:
+            snippet = f"[matched: bad_url] " + clean[:150]
         print(f"[antibot-debug] {page.url} -> {snippet!r}")
         return None, None, "bad/unavailable/category/antibot page", snippet
     title, price = await jsonld_price(page, fallback_title)
