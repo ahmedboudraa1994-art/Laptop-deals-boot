@@ -480,7 +480,8 @@ async def get_product_data(page, fallback_title, strict):
 
 
 async def collect_links(page, search_url, cfg):
-    debug = {"anchors": 0, "bad_domain": 0, "bad_url": 0, "bad_hint": 0, "bad_title": 0, "kept": 0}
+    debug = {"anchors": 0, "bad_domain": 0, "bad_url": 0, "bad_hint": 0, "bad_title": 0, "kept": 0,
+             "sample_bad_hint": [], "sample_bad_title": [], "sample_bad_url": []}
     try:
         anchors = await page.locator("a[href]").evaluate_all("""
             els => els.map(a => ({href: a.href, text: (a.innerText || a.textContent || '').trim()}))
@@ -498,14 +499,23 @@ async def collect_links(page, search_url, cfg):
         if not same_domain(full, cfg["domain"]):
             debug["bad_domain"] += 1; continue
         if is_bad_url(full):
-            debug["bad_url"] += 1; continue
+            debug["bad_url"] += 1
+            if len(debug["sample_bad_url"]) < 3:
+                debug["sample_bad_url"].append(full[:100])
+            continue
         matches_hint = any(h.lower() in full.lower() for h in cfg["hints"])
         if not matches_hint and cfg.get("hint_regex"):
             matches_hint = bool(re.search(cfg["hint_regex"], full, re.I))
         if not matches_hint:
-            debug["bad_hint"] += 1; continue
+            debug["bad_hint"] += 1
+            if len(debug["sample_bad_hint"]) < 3:
+                debug["sample_bad_hint"].append(full[:100])
+            continue
         if not valid_title(raw_title):
-            debug["bad_title"] += 1; continue
+            debug["bad_title"] += 1
+            if len(debug["sample_bad_title"]) < 3:
+                debug["sample_bad_title"].append(f"{raw_title[:60]!r} -> {full[:80]}")
+            continue
         if full in seen:
             continue
         seen.add(full)
@@ -529,14 +539,14 @@ async def scrape_site(browser, site_name, cfg):
                 if not await safe_goto(page, search_url):
                     stats["errors"] += 1; continue
                 links, dbg = await collect_links(page, search_url, cfg)
-                for k in ["anchors", "bad_domain", "bad_url", "bad_hint", "bad_title", "kept"]:
-                    pass
                 stats["links_found"] += dbg["anchors"]
                 stats["bad_domain"] += dbg["bad_domain"]
                 stats["bad_url"] += dbg["bad_url"]
                 stats["bad_hint"] += dbg["bad_hint"]
                 stats["bad_title"] += dbg["bad_title"]
                 stats["kept_links"] += dbg["kept"]
+                if dbg["sample_bad_hint"] or dbg["sample_bad_title"]:
+                    print(f"[sample-reject] [{site_name}] q={q!r} bad_hint examples={dbg['sample_bad_hint']} bad_title examples={dbg['sample_bad_title']}")
                 if not links:
                     await page.wait_for_timeout(2500)
                     links, dbg = await collect_links(page, search_url, cfg)
